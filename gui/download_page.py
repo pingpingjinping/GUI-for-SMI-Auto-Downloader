@@ -194,11 +194,11 @@ class DownloadPage:
             "SMI-DOWNLOADER",
             "애니시아에 등록된 전체 작품을 즐겨찾기에 추가할까요?\n"
             "기존 즐겨찾기는 유지되고, AnimeNo가 같은 작품은 중복 추가되지 않습니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
         )
 
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         self.widgets.yml_all_favorites_button.setEnabled(False)
