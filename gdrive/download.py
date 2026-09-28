@@ -18,6 +18,7 @@ from .exceptions import FileURLRetrievalError
 from .parse_url import parse_url
 
 CHUNK_SIZE = 512 * 1024  # 512KB
+REQUEST_TIMEOUT = 15
 home = osp.expanduser("~")
 
 def get_url_from_gdrive_confirmation(contents):
@@ -136,7 +137,7 @@ def get_file_name(url=None):
         is_gdrive_download_link = True
 
     while True:
-        res = sess.get(url, stream=True, verify=verify)
+        res = sess.get(url, stream=True, verify=verify, timeout=REQUEST_TIMEOUT)
 
         if not (gdrive_file_id and is_gdrive_download_link):
             break
@@ -311,7 +312,7 @@ def download(
         is_gdrive_download_link = True
 
     while True:
-        res = sess.get(url, stream=True, verify=verify)
+        res = sess.get(url, stream=True, verify=verify, timeout=REQUEST_TIMEOUT)
 
         if not (gdrive_file_id and is_gdrive_download_link):
             break
@@ -442,7 +443,7 @@ def download(
 
     if tmp_file is not None and f.tell() != 0:
         headers = {"Range": "bytes={}-".format(f.tell())}
-        res = sess.get(url, headers=headers, stream=True, verify=verify)
+        res = sess.get(url, headers=headers, stream=True, verify=verify, timeout=REQUEST_TIMEOUT)
 
     if not quiet:
         print(log_messages.get("start", "Downloading...\n"), file=sys.stderr, end="")
