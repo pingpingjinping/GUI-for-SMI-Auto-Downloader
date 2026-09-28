@@ -63,6 +63,9 @@ thread_lock = threading.Lock()
 isRunning = False
 quitSignal = False
 
+REQUEST_TIMEOUT = 10
+DOWNLOAD_TIMEOUT = 20
+
 def init_paths(autoPath):
     global outpath, log_path
     log_path = os.path.abspath('.') + "/log/"
@@ -87,8 +90,9 @@ def init_paths(autoPath):
 
 def download(url, file_name = None):
     with open(file_name, "wb") as file:  
-        response = requests.get(url)              
-        file.write(response.content)      
+        response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
+        file.write(response.content)
 
 def text_to_file(txt, file_name):
     f = open(file_name, 'w',encoding="UTF-8")
@@ -229,7 +233,11 @@ def requestAnimeSMI(AnimeNo,callback):
     download_progress_count = 0;
     download_progress_length = 0;
 
-    response = requests.get("https://api.anissia.net/anime/caption/animeNo/" + str(AnimeNo))
+    response = requests.get(
+        "https://api.anissia.net/anime/caption/animeNo/" + str(AnimeNo),
+        timeout=REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
 
     #print_log(response.status_code)
 
@@ -258,11 +266,15 @@ def requestAnimeSMI(AnimeNo,callback):
 
 
 def requestMultipleAnimeSMI(callback):
-    global smiDir,isDownloadError,download_progress_count,download_progress_length,console_output, AnimeName,AnimeNO,isRunning
+    global smiDir,isDownloadError,download_progress_count,download_progress_length,console_output, AnimeName,AnimeNO,isRunning,quitSignal
 
-    with open('anime.yml', encoding='UTF8') as f:
-        global outpath
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    # 새 일괄 다운로드를 시작할 때 이전 중지 상태를 초기화합니다.
+    quitSignal = False
+
+    try:
+        with open('anime.yml', encoding='UTF8') as f:
+            global outpath
+            config = yaml.load(f, Loader=yaml.FullLoader)
 
         animelist = json.loads(config['anime_list'])
 
@@ -278,60 +290,100 @@ def requestMultipleAnimeSMI(callback):
 
         new_filename = get_new_log_file()
 
-        download_progress_count = 0;
-        download_progress_length = 0;
+        # 일괄 다운로드에서는 파일 수를 미리 세지 않습니다.
+        # 진행률은 전체 작품 수 기준으로 표시합니다.
+        download_progress_count = 0
+        download_progress_length = 0
+        total_anime = len(animelist)
 
-        key1 = []
-        key2 = []
-        list = []
+        if total_anime == 0:
+            print_log("[=] 즐겨찾기에 등록된 작품이 없습니다.")
+            text_to_file(console_output, log_path + new_filename)
+            callback(0, 0, "즐겨찾기에 등록된 작품이 없습니다.", True)
+            return
 
-        print_log("다운로드 사이즈를 체크 하고 있습니다.....")
-        
-        for k in animelist:
+        callback(0, total_anime, f"작품 0/{total_anime} - 다운로드 시작...")
+
+        completed_anime = 0
+
+        for index, k in enumerate(animelist, start=1):
+            if quitSignal == True:
+                print_log("[=] 사용자가 일괄 다운로드를 중지했습니다.")
+                break
+
             AnimeName = k['Anime']
             AnimeNO = k['AnimeNo']
+            base_status = f"작품 {index}/{total_anime} - {AnimeName}"
+
+            callback(index - 1, total_anime, base_status + " 확인 중...")
+            print_log(f"[{index}/{total_anime}] <{AnimeName}> 자막 정보 확인")
 
             try:
-                response = requests.get("https://api.anissia.net/anime/caption/animeNo/" + str(AnimeNO))
-            except Exception as e:
-                print_log("[-] 현재 애니시아 서버와 연결할수 없습니다..... :-(")
-                break
+                response = requests.get(
+                    "https://api.anissia.net/anime/caption/animeNo/" + str(AnimeNO),
+                    timeout=REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
 
-            #print_log(response.status_code)
-            datas = json.loads(response.text)
-            json_data = datas["data"]
-            
-            #다운로드 사이즈 체크
-            download_progress_length += get_download_progress_length(json_data);
-            list.append(json_data)
-            key1.append(AnimeName)
-            key2.append(AnimeNO)
+                datas = response.json()
+                json_data = datas.get("data", [])
+
+                if not json_data:
+                    print_log("[=] 등록된 자막 정보가 없습니다.")
+                else:
+                    # 내부 파일 다운로드 콜백이 전체 진행률을 덮어쓰지 않도록
+                    # 대량 모드에서는 작품 진행률로 변환해서 전달합니다.
+                    def bulk_callback(_progress, _count, output="None", isFinished=False):
+                        if output == "None":
+                            status = "다운로드 중..."
+                        else:
+                            status = output
+                            prefix = "<" + AnimeName + "> "
+                            if status.startswith(prefix):
+                                status = status[len(prefix):]
+                        callback(
+                            index - 1,
+                            total_anime,
+                            base_status + " " + status
+                        )
+
+                    _requestAnimeSMI(AnimeNO, bulk_callback, new_filename, json_data)
+
+            except requests.Timeout:
+                print_log(f"[-] 애니시아 응답 시간 초과({REQUEST_TIMEOUT}초). 다음 작품으로 넘어갑니다.")
+            except requests.RequestException as e:
+                print_log("[-] 애니시아 요청 실패. 다음 작품으로 넘어갑니다. : %s" % e)
+            except (ValueError, KeyError, TypeError) as e:
+                print_log("[-] 애니시아 응답 처리 실패. 다음 작품으로 넘어갑니다. : %s" % e)
+            except Exception as e:
+                print_log("[-] 작품 처리 중 오류. 다음 작품으로 넘어갑니다. : %s" % e)
+                print_log(traceback.format_exc())
+
+            completed_anime = index
+            callback(index, total_anime, base_status + " 완료")
+            text_to_file(console_output, log_path + new_filename)
 
         print_log("================================================================")
-        
-        text_to_file(console_output, log_path + new_filename)    
-        callback(download_progress_count,download_progress_length, "다운로드에 필요한 데이터를 확인 하고 있습니다...")
 
-        count = 0
-        for json_data in list:
+        if quitSignal == True:
+            finish_message = f"다운로드가 중지되었습니다. ({completed_anime}/{total_anime})"
+        else:
+            finish_message = f"전체 작품 처리가 완료되었습니다. ({completed_anime}/{total_anime})"
 
-            if quitSignal == True:
-                break
-
-            AnimeName = key1[count]
-            AnimeNO = key2[count]
-            _requestAnimeSMI(AnimeNO,callback,new_filename,json_data)
-            count += 1
-
-
-        print_log("다운로드 진행상황 => "+str(download_progress_count)+"/"+str(download_progress_length))
-        print_log("작업이 종료되었습니다")
-
+        print_log(finish_message)
         text_to_file(console_output, log_path + new_filename)
+        callback(completed_anime, total_anime, finish_message, True)
 
-        callback(download_progress_count,download_progress_length,"다운로드가 완료되었습니다.",True)
-
+    except Exception as e:
+        print_log("[-] 일괄 다운로드 중 오류가 발생했습니다. : %s" % e)
+        print_log(traceback.format_exc())
+        try:
+            callback(0, 0, "일괄 다운로드 중 오류가 발생했습니다.", True)
+        except Exception:
+            pass
+    finally:
         unlock_Scheduler()
+
 
 def _requestAnimeSMI(AnimeNo,callback,new_filename,json_data):
     global AnimeName,smiDir,isDownloadError,download_progress_count,download_progress_length,console_output
@@ -479,7 +531,7 @@ def download_naver(url,callback):
                         key = each_file[start_index:end_index]
                         each_file = "https://drive.google.com/uc?id="+key
 
-                        remotefile = urlopen(each_file)
+                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                         fileName = remotefile.headers.get_filename();
 
                         if fileName is not None:
@@ -514,7 +566,7 @@ def download_naver(url,callback):
                     # 일반 다운로드 주소가 검출되었을때
                     elif bool(p_attach.match(each_file)) == False:
                         print_log("  Link : %s" % each_file)
-                        remotefile = urlopen(each_file)
+                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                         fileName = remotefile.headers.get_filename();
 
                         if fileName is not None:
@@ -606,7 +658,7 @@ def get_url_source_naver(url):
     global isDownloadError
     try:
         while url.find("PostView.naver") == -1 and url.find("PostList.naver") == -1:
-            f = request.urlopen(url)
+            f = request.urlopen(url, timeout=REQUEST_TIMEOUT)
             url_info = f.info()
             url_charset = client.HTTPMessage.get_charsets(url_info)[0]
             url_source = f.read().decode(url_charset)
@@ -623,7 +675,7 @@ def get_url_source_naver(url):
             last_url = url
 
         print_log("   => Last URL : %s\n" % last_url)
-        f = request.urlopen(last_url)
+        f = request.urlopen(last_url, timeout=REQUEST_TIMEOUT)
         url_info = f.info()
         url_charset = client.HTTPMessage.get_charsets(url_info)[0]
         url_source = f.read().decode(url_charset)
@@ -703,7 +755,7 @@ def download_tistory(url,callback):
                         key = each_file[start_index:end_index]
                         each_file = "https://drive.google.com/uc?id="+key
 
-                        remotefile = urlopen(each_file)
+                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                         fileName = remotefile.headers.get_filename();
 
                         if fileName is not None:
@@ -738,7 +790,7 @@ def download_tistory(url,callback):
                     # 일반 다운로드 주소가 검출되었을때
                     elif bool(p_attach.match(each_file)) == False:
                         print_log("  Link : %s" % each_file)
-                        remotefile = urlopen(each_file)
+                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                         fileName = remotefile.headers.get_filename();
 
                         if fileName is not None:
@@ -833,7 +885,7 @@ def get_url_source_tistory(url):
     global isDownloadError
     try:
         try:
-            f = request.urlopen(url)
+            f = request.urlopen(url, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             # 한글 URL 검출시 quote로 감싸야됨
             # 'ascii' codec can't encode characters in position 11-13: ordinal not in range(128) 방지
@@ -841,7 +893,7 @@ def get_url_source_tistory(url):
             body = url[:last_slash_index]
             query = quote(url[last_slash_index:])
             #print_log("출력=> "+body + query)
-            f = request.urlopen(body + query)
+            f = request.urlopen(body + query, timeout=REQUEST_TIMEOUT)
 
         url_info = f.info()
         url_charset = client.HTTPMessage.get_charsets(url_info)[0]
@@ -900,7 +952,7 @@ def download_blogspot(url,callback):
                 key = each_file[start_index:end_index]
                 each_file = "https://drive.google.com/uc?id="+key
 
-                remotefile = urlopen(each_file)
+                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                 fileName = remotefile.headers.get_filename();
 
                 if fileName is not None:
@@ -936,7 +988,7 @@ def download_blogspot(url,callback):
             # 일반 다운로드 주소가 검출되었을때
             elif bool(p_attach.match(each_file)) == False:
                 print_log("  Link : %s" % each_file)
-                remotefile = urlopen(each_file)
+                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                 fileName = remotefile.headers.get_filename();
 
                 if fileName is not None:
@@ -1016,7 +1068,7 @@ def get_url_source_blogspot(url):
     global isDownloadError
     try:
         try:
-            f = request.urlopen(url)
+            f = request.urlopen(url, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             # 한글 URL 검출시 quote로 감싸야됨
             # 'ascii' codec can't encode characters in position 11-13: ordinal not in range(128) 방지
@@ -1024,7 +1076,7 @@ def get_url_source_blogspot(url):
             body = url[:last_slash_index]
             query = quote(url[last_slash_index:])
             #print_log("출력=> "+body + query)
-            f = request.urlopen(body + query)
+            f = request.urlopen(body + query, timeout=REQUEST_TIMEOUT)
         url_info = f.info()
         url_charset = client.HTTPMessage.get_charsets(url_info)[0]
         url_source = f.read().decode(url_charset)
@@ -1099,7 +1151,7 @@ def find_blog_standard(temps,callback):
                 key = each_file[start_index:end_index]
                 each_file = "https://drive.google.com/uc?id="+key
 
-                remotefile = urlopen(each_file)
+                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                 fileName = remotefile.headers.get_filename();
 
                 if fileName is not None:
@@ -1222,7 +1274,7 @@ def find_blog_1(temps,url,callback):
                 key = each_file[start_index:end_index]
                 each_file = "https://drive.google.com/uc?id="+key
 
-                remotefile = urlopen(each_file)
+                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
                 fileName = remotefile.headers.get_filename();
 
                 if fileName is not None:
@@ -1300,7 +1352,7 @@ def get_url_source_website(url):
     try:
         try:
             req = request.Request(url, headers=headers)
-            f = request.urlopen(req)
+            f = request.urlopen(req, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             # 한글 URL 검출시 quote로 감싸야됨
             # 'ascii' codec can't encode characters in position 11-13: ordinal not in range(128) 방지
@@ -1308,7 +1360,7 @@ def get_url_source_website(url):
             body = url[:last_slash_index]
             query = quote(url[last_slash_index:])
             #print_log("출력=> "+body + query)
-            f = request.urlopen(body + query)
+            f = request.urlopen(body + query, timeout=REQUEST_TIMEOUT)
         url_info = f.info()
         url_charset = client.HTTPMessage.get_charsets(url_info)[0]
         url_source = f.read().decode(url_charset)
