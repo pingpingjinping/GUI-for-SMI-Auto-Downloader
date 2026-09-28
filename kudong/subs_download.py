@@ -15,6 +15,7 @@ from urllib.request import urlopen
 from urllib.parse import unquote
 from urllib.parse import quote
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -874,199 +875,211 @@ def get_url_source_naver(url):
         return None
 
 
+def _is_download_candidate_link(file_url):
+    if not file_url:
+        return False
+
+    decoded = unquote(str(file_url)).lower()
+    parsed = urlparse(decoded)
+
+    if "/attachment/" in decoded:
+        return True
+    if "blog.kakaocdn.net" in decoded:
+        return True
+    if "t1.daumcdn.net/cfile/tistory" in decoded:
+        return True
+    if "drive.google.com/file/d/" in decoded:
+        return True
+    if "drive.google.com/uc" in decoded:
+        return True
+    if "docs.google.com/uc" in decoded:
+        return True
+    if "drive.usercontent.google.com/download" in decoded:
+        return True
+
+    return p_extension.match(parsed.path) is not None
+
+
+def _normalize_google_drive_link(file_url):
+    if not file_url:
+        return file_url
+
+    match = re.search(
+        r"drive\\.google\\.com/file/d/([^/?#]+)",
+        file_url,
+        re.IGNORECASE,
+    )
+    if match:
+        return "https://drive.google.com/uc?id=" + match.group(1)
+
+    parsed = urlparse(file_url)
+    id_match = re.search(r"(?:^|&)id=([^&]+)", parsed.query)
+    if id_match and (
+        "drive.google.com/uc" in file_url
+        or "docs.google.com/uc" in file_url
+        or "drive.usercontent.google.com/download" in file_url
+    ):
+        return "https://drive.google.com/uc?id=" + id_match.group(1)
+
+    return file_url
+
+
+def _article_links_with_tistory_fallback(url_source, page_url):
+    soup = BeautifulSoup(url_source, "html.parser")
+    containers = [
+        soup.select_one(".tt_article_useless_p_margin.contents_style"),
+        soup.select_one(".contents_style"),
+        soup.select_one(".entry-content"),
+        soup.select_one(".article-view"),
+        soup.select_one(".post-content"),
+        soup.find("article"),
+    ]
+    container = next((item for item in containers if item is not None), soup)
+
+    links = []
+    seen = set()
+    for a_tag in container.find_all("a"):
+        href = a_tag.get("href")
+        if not href:
+            continue
+
+        href = urljoin(page_url, href.strip().replace("&amp;", "&"))
+        if href in seen:
+            continue
+        seen.add(href)
+
+        if not _is_download_candidate_link(href):
+            continue
+
+        links.append((href, a_tag.get("download") or a_tag.get_text(strip=True)))
+
+    return links
+
+
+def _download_detected_link(file_url, suggested_name, callback):
+    global download_progress_count
+
+    original_url = file_url
+    file_url = _normalize_google_drive_link(file_url)
+    is_google = (
+        "drive.google.com/uc" in file_url
+        or "docs.google.com/uc" in file_url
+        or "drive.usercontent.google.com/download" in file_url
+    )
+
+    remotefile = urlopen(file_url, timeout=REQUEST_TIMEOUT)
+    fileName = remotefile.headers.get_filename()
+
+    if fileName is not None:
+        try:
+            fileName = fileName.encode("ISO-8859-1").decode("UTF-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    else:
+        candidate = (suggested_name or "").strip()
+        if candidate and p_extension.match(candidate):
+            fileName = candidate
+        else:
+            parsed_url = urlparse(original_url)
+            fileName = unquote(os.path.basename(parsed_url.path))
+
+    if is_google and fileName in ("uc", "download", ""):
+        fileName = gdrive.get_file_name(file_url)
+
+    if not fileName or not p_extension.match(fileName):
+        return False
+
+    print_log("  Link : %s" % file_url)
+    print_log("[=] 다운로드 시작 => " + fileName)
+
+    path = outpath + smiDir
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    if is_google:
+        gdrive.download(file_url, path + fileName, quiet=False)
+    else:
+        download(file_url, path + fileName)
+
+    print_log("[+] 파일 다운로드가 완료 되었습니다. ")
+    download_progress_count += 1
+    callback(download_progress_count, download_progress_length)
+    return True
+
+
 def download_tistory(url,callback):
     global isDownloadError,download_progress_count, download_progress_length
-    url_source = get_url_source_tistory(url)
 
+    url_source = get_url_source_tistory(url)
     if url_source is None:
+        isDownloadError = 1
         return
 
-    # find 's1.daumcdn.net/cfs.tistory'
-    if url_source.find("t1.daumcdn.net/tistory") == -1:
-        print_log("[-] It is not a Tistory Blog")
-        isDownloadError = 1;
-        return;
+    file_found = 0
+    candidates = _article_links_with_tistory_fallback(url_source, url)
 
     try:
-        # find all 'attach file link'
-        p_attach = re.compile(r"href=[\'\"](\S+?/attachment/.*?)[\'\"]\s*.*?/> (.*?)</", re.IGNORECASE | re.DOTALL)
-        result = p_attach.findall(url_source)
+        old_attachment_pattern = re.compile(
+            r"href=[\\'\\\"]([^\\'\\\"]*?/attachment/[^\\'\\\"]*)[\\'\\\"]",
+            re.IGNORECASE | re.DOTALL,
+        )
+        seen = set(item[0] for item in candidates)
+        for old_url in old_attachment_pattern.findall(url_source):
+            old_url = urljoin(url, old_url.replace("&amp;", "&"))
+            if old_url not in seen:
+                candidates.insert(0, (old_url, ""))
+                seen.add(old_url)
 
-        if result:
-            
-            for each_file in result:
-                file_url = each_file[0]
-                if each_file[1] == "":
-                    file_name = file_url[file_url.rfind('/') + 1:]
-                else:
-                    file_name = each_file[1]
-                print_log("* File : %s" % file_name)
-                print_log("  Link : %s" % file_url)
-                print_log("[=] 다운로드 시작 => "+file_name)
+        if not candidates:
+            print_log("[-] Attached File not found !!")
+            isDownloadError = 1
+            return
 
-                path = outpath + smiDir
-                if not os.path.exists(path):
-                    os.makedirs(path)
-
-                download(file_url, path + file_name)
-                print_log("[+] 파일 다운로드가 완료 되었습니다. ")
+        for each_file, suggested_name in candidates:
+            try:
+                if _download_detected_link(each_file, suggested_name, callback):
+                    file_found = 1
+            except urllib.error.HTTPError as e:
+                print_log("[-] 다운로드 실패 : %s" % e)
+                isDownloadError = 1
                 download_progress_count += 1
-                callback(download_progress_count,download_progress_length)
-        else:
-            soup = BeautifulSoup(url_source, 'html.parser')
-            temps = soup.find('div',class_="tt_article_useless_p_margin contents_style")    
-        
-            if(temps is None):
-                temps = soup.find('div', {'class': 'contents_style'})
+            except Exception as e:
+                print_log("[-] Error : %s" % e)
+                print_log(traceback.format_exc())
+                isDownloadError = 1
+                download_progress_count += 1
 
-            links = temps.find_all("a")
-            file_found = 0;
+        if file_found == 0:
+            print_log("[-] Attached File not found !!")
+            isDownloadError = 1
 
-            p_attach = re.compile(r"(.*(googleusercontent).*)")
-            p_google = re.compile(r"(.*(https://drive.google.com/file/d/).*)")
-
-            for a in links:
-                if a.get('href') == None:
-                    continue;
-                each_file = a.attrs['href']
-                # print_log("href = "+each_file)
-                try:
-                    each_file = each_file.replace('&amp;','&');
-
-                    # 구글 드라이브 주소가 검출되었을때
-                    if bool(p_google.match(each_file)):
-
-                        start_index = each_file.find("/d/") + 3;
-                        end_index =  each_file.rfind("/view");
-
-                        key = each_file[start_index:end_index]
-                        each_file = "https://drive.google.com/uc?id="+key
-
-                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
-                        fileName = remotefile.headers.get_filename();
-
-                        if fileName is not None:
-                            fileName = fileName.encode('ISO-8859-1').decode('UTF-8');
-                        else:
-                            parsed_url = urlparse(each_file)
-                            fileName = os.path.basename(parsed_url.path)
-                            fileName = unquote(fileName)
-
-                        path = outpath + smiDir
-
-                        if fileName == "uc":
-                            fileName = gdrive.get_file_name(each_file)
-                    
-                        if(not p_extension.match(fileName)):
-                            download_progress_count += 1
-                            callback(download_progress_count,download_progress_length)
-                            continue;
-
-                        print_log("[=] 다운로드 시작 => "+ fileName)
-
-                        if not os.path.exists(path):
-                            os.makedirs(path)
-
-                        gdrive.download(each_file, path + fileName, quiet=False)
-                        print_log("[+] 파일 다운로드가 완료 되었습니다. ")
-
-                        file_found = 1;
-                        download_progress_count += 1
-                        callback(download_progress_count,download_progress_length)
-
-                    # 일반 다운로드 주소가 검출되었을때
-                    elif bool(p_attach.match(each_file)) == False:
-                        print_log("  Link : %s" % each_file)
-                        remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
-                        fileName = remotefile.headers.get_filename();
-
-                        if fileName is not None:
-                            fileName = fileName.encode('ISO-8859-1').decode('UTF-8');
-                        else:
-                            parsed_url = urlparse(each_file)
-                            fileName = os.path.basename(parsed_url.path)
-                            fileName = unquote(fileName)
-
-                        print_log("[=] 다운로드 시작 => "+fileName)
-
-                        path = outpath + smiDir
-                        if not os.path.exists(path):
-                            os.makedirs(path)
-
-                        download(each_file, path + fileName);
-                        isDownloaded = 1;
-                        file_found = 1;
-                        print_log("[+] 파일 다운로드가 완료 되었습니다. ")
-                        download_progress_count += 1
-                        callback(download_progress_count,download_progress_length)
-
-                except urllib.error.HTTPError as e:
-                    print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
-                    download_progress_count += 1    
-                except Exception as e:
-                    print_log("[-] Error : %s" % e)
-                    print_log(traceback.format_exc())
-                    download_progress_count += 1
-            
-            if(file_found == 0):
-                print_log("[-] Attached File not found !!")
-                isDownloadError = 1;
-    
     except Exception as e:
         print_log("[-] Error : %s" % e)
         print_log(traceback.format_exc())
-        isDownloadError = 1;   
+        isDownloadError = 1
+
 
 def download_count_tistory(url):
     url_source = get_url_source_tistory(url)
-
     if url_source is None:
         return 0
-    
-    if url_source.find("t1.daumcdn.net/tistory") == -1:
-        return 0;
-
-    download_count = 0
 
     try:
-        p_attach = re.compile(r"href=[\'\"](\S+?/attachment/.*?)[\'\"]\s*.*?/> (.*?)</", re.IGNORECASE | re.DOTALL)
-        result = p_attach.findall(url_source)
+        candidates = _article_links_with_tistory_fallback(url_source, url)
+        old_attachment_pattern = re.compile(
+            r"href=[\\'\\\"]([^\\'\\\"]*?/attachment/[^\\'\\\"]*)[\\'\\\"]",
+            re.IGNORECASE | re.DOTALL,
+        )
 
-        if result:
-            return result.len()
-        else:
-            soup = BeautifulSoup(url_source, 'html.parser')
-            temps = soup.find('div',class_="tt_article_useless_p_margin contents_style")    
-            
-            if(temps is None):
-                temps = soup.find('div', {'class': 'contents_style'})
+        seen = set(item[0] for item in candidates)
+        for old_url in old_attachment_pattern.findall(url_source):
+            old_url = urljoin(url, old_url.replace("&amp;", "&"))
+            seen.add(old_url)
 
-            links = temps.find_all("a")
+        return len(seen)
+    except Exception:
+        return 0
 
-            p_attach = re.compile(r"(.*(googleusercontent).*)")
-            p_google = re.compile(r"(.*(https://drive.google.com/file/d/).*)")
-
-            for a in links:
-                if a.get('href') == None:
-                    continue;
-                each_file = a.attrs['href']
-                try:
-                    each_file = each_file.replace('&amp;','&');
-                    # 구글 드라이브 주소가 검출되었을때
-                    if bool(p_google.match(each_file)):
-                        download_count += 1
-
-                    # 일반 다운로드 주소가 검출되었을때
-                    elif bool(p_attach.match(each_file)) == False:
-                        download_count += 1
-
-                except Exception as e:
-                    download_count += 0
-
-    except Exception as e:
-        download_count += 0   
-    
-    return download_count
 
 def get_url_source_tistory(url):
     global isDownloadError
@@ -1288,99 +1301,53 @@ def extract_csrf_token(html, url_source=None):
 
 def download_website(url,callback):
     global isDownloadError, download_progress_count, download_progress_length
-    url_source = get_url_source_website(url)
 
+    url_source = get_url_source_website(url)
     if url_source is None:
+        isDownloadError = 1
         return
 
-    soup = BeautifulSoup(url_source, 'html.parser')
-    temps = soup.find('div')
-
-    isDownloaded = 0;
-    isDownloaded = find_blog_standard(temps,callback)
+    soup = BeautifulSoup(url_source, "html.parser")
+    isDownloaded = find_blog_standard(soup, callback)
 
     if isDownloaded == 0:
-        isDownloadError = 1;
+        isDownloadError = 1
+
 
 def find_blog_standard(temps,callback):
     global isDownloadError, download_progress_count, download_progress_length
 
-    links = temps.find_all("a")
+    if temps is None:
+        return 0
 
-    for a in links:
-        each_file = a.attrs['href']
-        #print_log("href = "+each_file)
+    for a in temps.find_all("a"):
+        each_file = a.get("href")
+        if not each_file:
+            continue
+
+        each_file = each_file.replace("&amp;", "&")
+        if not _is_download_candidate_link(each_file):
+            continue
 
         try:
-            each_file = each_file.replace('&amp;','&');
-
-            if bool(p_google_2_1.match(each_file)):
-                start_index = each_file.find("&id=") + 4;
-                end_index =  each_file.rfind("&confirm");
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            if bool(p_google_2_2.match(each_file)):
-                start_index = each_file.find("&id=") + 4;
-                end_index =  len(each_file);
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            if bool(p_google_3.match(each_file)):
-                start_index = each_file.find("?id=") + 4;
-                end_index =  each_file.rfind("&export");
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            # 구글 드라이브 주소가 검출되었을때
-            if bool(p_google.match(each_file)):
-
-                start_index = each_file.find("/d/") + 3;
-                end_index =  each_file.rfind("/view");
-
-                key = each_file[start_index:end_index]
-                each_file = "https://drive.google.com/uc?id="+key
-
-                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
-                fileName = remotefile.headers.get_filename();
-
-                if fileName is not None:
-                    fileName = fileName.encode('ISO-8859-1').decode('UTF-8');
-                else:
-                    parsed_url = urlparse(each_file)
-                    fileName = os.path.basename(parsed_url.path)
-                    fileName = unquote(fileName)
-
-                path = outpath + smiDir
-
-                if fileName == "uc":
-                    fileName = gdrive.get_file_name(each_file)
-
-                #print_log(fileName);
-
-                if(not p_extension.match(fileName)):
-                    download_progress_count += 1
-                    callback(download_progress_count,download_progress_length)
-                    continue;
-
-                print_log("[=] 다운로드 시작 => "+ fileName)
-
-                if not os.path.exists(path):
-                    os.makedirs(path)
-
-                gdrive.download(each_file, path + fileName, quiet=False)
-                print_log("[+] 파일 다운로드가 완료 되었습니다. ")
-                    
-                download_progress_count += 1
-                callback(download_progress_count,download_progress_length)
-                return 1;
+            if _download_detected_link(
+                each_file,
+                a.get("download") or a.get_text(strip=True),
+                callback,
+            ):
+                return 1
         except urllib.error.HTTPError as e:
-            print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
+            print_log("[-] 다운로드 실패 : %s" % e)
+            isDownloadError = 1
             download_progress_count += 1
-            return 0;
         except Exception as e:
             print_log("[-] Error : %s" % e)
             print_log(traceback.format_exc())
+            isDownloadError = 1
             download_progress_count += 1
-            return 0;
-    return 0;
+
+    return 0
+
 
 # Cloudflare Turnstile 인증으로 Deprecated 
 def find_blog_1(temps,url,callback):
