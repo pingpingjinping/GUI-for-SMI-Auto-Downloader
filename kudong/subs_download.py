@@ -90,8 +90,9 @@ def init_paths(autoPath):
 
 def download(url, file_name = None):
     with open(file_name, "wb") as file:  
-        response = requests.get(url)              
-        file.write(response.content)      
+        response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
+        file.write(response.content)
 
 def text_to_file(txt, file_name):
     f = open(file_name, 'w',encoding="UTF-8")
