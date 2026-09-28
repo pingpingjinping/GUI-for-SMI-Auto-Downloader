@@ -757,10 +757,12 @@ def download_naver(url,callback):
                     file_found = 1
 
             except urllib.error.HTTPError as e:
-                print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
+                print_log("[-] 다운로드 실패 : %s" % e)
+                isDownloadError = 1
                 download_progress_count += 1
             except Exception as e:
                 print_log("[-] Error : %s" % e)
+                isDownloadError = 1
                 download_progress_count += 1
 
         if file_found == 0:
