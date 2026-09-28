@@ -394,6 +394,9 @@ class DownloadPage:
         global isScheduler_button_clicked
         if isScheduler_button_clicked == False: # 시작 로직
 
+            # 이전 실행에서 남은 중지 신호를 초기화합니다.
+            set_global_quitSignal(False)
+
             idx = self.widgets.scheduler_comboBox.currentIndex()
 
             #"반복 없음"이 스케쥴러 모드에서 버튼 클릭 되었을때 처리
@@ -458,6 +461,11 @@ class DownloadPage:
                     self.timer.start(day)
                     
         else: # 중지 로직
+            # 현재 네트워크 요청이 timeout으로 풀리면 다음 작품으로 넘어가지 않습니다.
+            set_global_quitSignal(True)
+            self.widgets.left_progressName.setText("다운로드 중지 요청됨...")
+            self.widgets.left_progressName.setWordWrap(True)
+
             beforeSheet = "background-color: rgb(52, 59, 72); font-size: " + str(fs(10, 16)) + "px;"
             self.widgets.scheduler_button.setStyleSheet(beforeSheet)
             
