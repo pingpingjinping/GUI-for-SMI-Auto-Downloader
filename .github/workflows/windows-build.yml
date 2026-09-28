@@ -47,6 +47,81 @@ jobs:
         run: |
           python setup.py build
 
+      - name: Trim unused Qt runtime
+        shell: pwsh
+        run: |
+          $buildDir = Get-ChildItem -Path build -Directory |
+            Where-Object { $_.Name -like "exe.*" } |
+            Select-Object -First 1
+
+          if (-not $buildDir) {
+            throw "cx_Freeze build directory was not found."
+          }
+
+          $pysideDir = Join-Path $buildDir.FullName "lib\PySide6"
+          if (-not (Test-Path $pysideDir)) {
+            throw "PySide6 runtime directory was not found."
+          }
+
+          # The app imports only QtCore, QtGui and QtWidgets.
+          # Keep the binding runtime and remove unrelated Qt modules copied by cx_Freeze.
+          $keepRootFiles = @(
+            "Qt6Core.dll",
+            "Qt6Gui.dll",
+            "Qt6Widgets.dll",
+            "QtCore.pyd",
+            "QtGui.pyd",
+            "QtWidgets.pyd",
+            "pyside6.abi3.dll",
+            "__init__.pyc",
+            "_cx_freeze_debug.pyc"
+          )
+
+          Get-ChildItem $pysideDir -File |
+            Where-Object { $_.Name -notin $keepRootFiles } |
+            Remove-Item -Force
+
+          # QML, translations and development/runtime extras are not used by this Widgets app.
+          @("qml", "translations", "include", "typesystems", "glue", "scripts") | ForEach-Object {
+            $path = Join-Path $pysideDir $_
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
+          }
+
+          # Keep only plugins needed by a regular Windows Widgets app.
+          $pluginsDir = Join-Path $pysideDir "plugins"
+          if (Test-Path $pluginsDir) {
+            Get-ChildItem $pluginsDir -Directory |
+              Where-Object { $_.Name -notin @("platforms", "imageformats", "styles") } |
+              Remove-Item -Recurse -Force
+
+            $platformsDir = Join-Path $pluginsDir "platforms"
+            if (Test-Path $platformsDir) {
+              Get-ChildItem $platformsDir -File |
+                Where-Object { $_.Name -ne "qwindows.dll" } |
+                Remove-Item -Force
+            }
+          }
+
+      - name: Smoke test frozen executable
+        shell: pwsh
+        run: |
+          $buildDir = Get-ChildItem -Path build -Directory |
+            Where-Object { $_.Name -like "exe.*" } |
+            Select-Object -First 1
+          $exePath = Join-Path $buildDir.FullName "SMI-Auto-Downloader.exe"
+
+          $process = Start-Process -FilePath $exePath -WorkingDirectory $buildDir.FullName -PassThru
+          Start-Sleep -Seconds 5
+          $process.Refresh()
+
+          if ($process.HasExited) {
+            throw "Frozen executable exited during smoke test. ExitCode=$($process.ExitCode)"
+          }
+
+          Stop-Process -Id $process.Id -Force
+
       - name: Verify and package build
         id: package
         shell: pwsh
