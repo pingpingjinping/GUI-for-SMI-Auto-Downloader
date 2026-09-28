@@ -561,13 +561,13 @@ def _extract_naver_attachment_files(url_source):
             a_tag.get("download") or a_tag.get_text(strip=True),
         )
 
-    # Legacy SmartEditor: aPostFiles[1] = JSON.parse('[...]'.replace(...))
+    # Legacy SmartEditor variant A:
+    # aPostFiles[1] = JSON.parse('[...]'.replace(...))
     p_attached_file = re.compile(
-        r"aPostFiles\[1\]\s*=\s*JSON\.parse\('(\[.*?\])'\s*\.replace",
+        r"aPostFiles\[\d+\]\s*=\s*JSON\.parse\('(\[.*?\])'\s*\.replace",
         re.IGNORECASE | re.DOTALL,
     )
-    match = p_attached_file.search(url_source)
-    if match:
+    for match in p_attached_file.finditer(url_source):
         try:
             data = match.group(1).replace("\\'", '"')
             json_data = json.loads(data)
@@ -579,6 +579,58 @@ def _extract_naver_attachment_files(url_source):
                 )
         except (TypeError, ValueError, json.JSONDecodeError) as e:
             print_log("[-] NAVER legacy attachment JSON parse failed: %s" % e)
+
+    # Legacy SmartEditor variant B:
+    # aPostFiles[1] = [{'encodedAttachFileName': '...', ...}]
+    # Old NAVER posts commonly expose attachment metadata in this direct
+    # JavaScript array instead of JSON.parse(...). Parse each object without
+    # trying to evaluate JavaScript.
+    direct_array_pattern = re.compile(
+        r"aPostFiles\[\d+\]\s*=\s*(\[.*?\])\s*;",
+        re.IGNORECASE | re.DOTALL,
+    )
+    object_pattern = re.compile(r"\{.*?\}", re.DOTALL)
+
+    def legacy_value(obj_text, key):
+        pattern = re.compile(
+            r"['\"]?"
+            + re.escape(key)
+            + r"['\"]?\s*:\s*(['\"])(.*?)\1",
+            re.IGNORECASE | re.DOTALL,
+        )
+        value_match = pattern.search(obj_text)
+        if value_match is None:
+            return None
+        return (
+            value_match.group(2)
+            .replace(r"\/", "/")
+            .replace(r"\'", "'")
+            .replace(r'\\"', '"')
+        )
+
+    for array_match in direct_array_pattern.finditer(url_source):
+        for obj_match in object_pattern.finditer(array_match.group(1)):
+            obj_text = obj_match.group(0)
+            add_file(
+                legacy_value(obj_text, "encodedAttachFileUrl"),
+                legacy_value(obj_text, "encodedAttachFileName"),
+                legacy_value(obj_text, "attachFileSize"),
+            )
+
+    # Final safety net: some NAVER pages embed the same attachment object under
+    # a different script variable. If an object still contains the canonical
+    # encodedAttachFile* fields, extract it regardless of the outer variable.
+    generic_object_pattern = re.compile(
+        r"\{[^{}]*?encodedAttachFileUrl[^{}]*?\}",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for obj_match in generic_object_pattern.finditer(url_source):
+        obj_text = obj_match.group(0)
+        add_file(
+            legacy_value(obj_text, "encodedAttachFileUrl"),
+            legacy_value(obj_text, "encodedAttachFileName"),
+            legacy_value(obj_text, "attachFileSize"),
+        )
 
     return files
 
@@ -801,25 +853,60 @@ def get_url_source_naver(url):
     try:
         blog_id, log_no = _naver_post_ids(url)
 
-        # Modern NAVER Blog pages are more stable through the mobile PostView
-        # endpoint and do not require the legacy mainFrame traversal.
         if blog_id and log_no:
-            last_url = (
+            # Modern SmartEditor content is usually easiest to parse from the
+            # mobile PostView, while many legacy attachments (aPostFiles) only
+            # appear in the desktop PostView. Fetch both and parse the combined
+            # HTML so one parser supports both generations.
+            sources = []
+
+            mobile_url = (
                 "https://m.blog.naver.com/PostView.naver?blogId="
                 + quote(blog_id)
                 + "&logNo="
                 + log_no
                 + "&proxyReferer="
             )
-            print_log("   => Last URL : %s\n" % last_url)
+            print_log("   => Mobile URL : %s" % mobile_url)
 
-            response = requests.get(
-                last_url,
-                headers=NAVER_REQUEST_HEADERS,
-                timeout=REQUEST_TIMEOUT,
+            try:
+                response = requests.get(
+                    mobile_url,
+                    headers=NAVER_REQUEST_HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                sources.append(response.text)
+            except Exception as e:
+                print_log("   => Mobile source failed: %s" % e)
+
+            desktop_url = (
+                "https://blog.naver.com/PostView.naver?blogId="
+                + quote(blog_id)
+                + "&logNo="
+                + log_no
+                + "&redirect=Dlog&widgetTypeCall=true"
+                + "&noTrackingCode=true&directAccess=false"
             )
-            response.raise_for_status()
-            return response.text
+            print_log("   => Desktop URL : %s\n" % desktop_url)
+
+            try:
+                response = requests.get(
+                    desktop_url,
+                    headers=NAVER_REQUEST_HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                sources.append(response.text)
+            except Exception as e:
+                # Desktop PostView may reject some posts while mobile still
+                # works. Keep the usable source instead of failing the post.
+                print_log("   => Desktop source failed: %s" % e)
+
+            if sources:
+                return "\n<!-- NAVER SOURCE BREAK -->\n".join(sources)
+
+            raise RuntimeError("NAVER mobile/desktop sources both failed")
 
         # Legacy/fallback path for unusual NAVER Blog URLs such as PostList.
         current_url = url
