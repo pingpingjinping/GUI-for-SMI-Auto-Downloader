@@ -17,11 +17,12 @@ from PySide6.QtWidgets import (
 
 from kudong import (
     get_pending_auth_items,
-    open_url,
     progress_callback,
+    queue_all_pending_auth_retries,
     queue_pending_auth_retry,
     remove_pending_auth_item,
     reset_pending_auth_runtime_statuses,
+    retry_all_pending_auth_items,
     retry_pending_auth_item,
     set_pending_auth_changed_provider,
 )
@@ -79,17 +80,20 @@ class PendingMenuButton(QPushButton):
 class PendingAuthPage(QObject):
     pendingChanged = Signal()
     retryFinished = Signal(str)
+    batchFinished = Signal(str)
 
     def __init__(self, MainWindow, widgets):
         super().__init__(MainWindow)
         self.MainWindow = MainWindow
         self.widgets = widgets
+        self._batch_running = False
         reset_pending_auth_runtime_statuses()
         self._build_menu_button()
         self._build_page()
 
         self.pendingChanged.connect(self.refresh)
         self.retryFinished.connect(self._on_retry_finished)
+        self.batchFinished.connect(self._on_batch_finished)
         set_pending_auth_changed_provider(self.pendingChanged.emit)
 
         self.refresh()
@@ -119,7 +123,8 @@ class PendingAuthPage(QObject):
 
         desc = QLabel(
             "CAPTCHA / Cloudflare 인증이 필요한 항목입니다. "
-            "자동 다운로드 중에는 창을 띄우지 않고 여기에 모아둡니다."
+            "자동 다운로드 중에는 창을 띄우지 않고 여기에 모아둡니다. "
+            "‘전체 처리 시작’을 누르면 현재 작업 종료 후 순서대로 인증/다운로드합니다."
         )
         desc.setWordWrap(True)
         root.addWidget(desc)
@@ -152,20 +157,19 @@ class PendingAuthPage(QObject):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
 
-        self.table.doubleClicked.connect(self._open_selected_url)
         root.addWidget(self.table, 1)
 
         button_row = QHBoxLayout()
 
-        self.retry_button = QPushButton("다음 차례에 다운로드")
+        self.batch_button = QPushButton("전체 처리 시작")
+        self.batch_button.setMinimumHeight(38)
+        self.batch_button.clicked.connect(self.retry_all)
+        button_row.addWidget(self.batch_button)
+
+        self.retry_button = QPushButton("선택 항목 처리")
         self.retry_button.setMinimumHeight(38)
         self.retry_button.clicked.connect(self.retry_selected)
         button_row.addWidget(self.retry_button)
-
-        self.open_button = QPushButton("URL 열기")
-        self.open_button.setMinimumHeight(38)
-        self.open_button.clicked.connect(self._open_selected_url)
-        button_row.addWidget(self.open_button)
 
         self.remove_button = QPushButton("목록에서 제거")
         self.remove_button.setMinimumHeight(38)
@@ -244,6 +248,75 @@ class PendingAuthPage(QObject):
             first.data(Qt.ItemDataRole.UserRole + 1),
         )
 
+    def retry_all(self):
+        if self._batch_running:
+            QMessageBox.information(
+                self.MainWindow,
+                "SMI-DOWNLOADER",
+                "보류목록 전체 처리가 이미 예약되어 있습니다.",
+            )
+            return
+
+        items = get_pending_auth_items()
+        if not items:
+            QMessageBox.information(
+                self.MainWindow,
+                "SMI-DOWNLOADER",
+                "처리할 보류 항목이 없습니다.",
+            )
+            return
+
+        if any(
+            item.get("status") in ("queued", "authenticating")
+            for item in items
+        ):
+            QMessageBox.information(
+                self.MainWindow,
+                "SMI-DOWNLOADER",
+                "이미 재시도 대기 또는 인증 중인 항목이 있습니다.",
+            )
+            return
+
+        count = queue_all_pending_auth_retries()
+        if count <= 0:
+            self.refresh()
+            return
+
+        self._batch_running = True
+        self.batch_button.setEnabled(False)
+        self.retry_button.setEnabled(False)
+        self.status_label.setText(
+            f"보류 {count}개 전체 처리를 예약했습니다. "
+            "현재 전체 다운로드가 진행 중이면 끝난 뒤 순서대로 처리합니다. "
+            "같은 사이트의 인증 쿠키는 가능한 동안 재사용합니다."
+        )
+        self.refresh()
+
+        worker = threading.Thread(
+            target=self._batch_worker,
+            daemon=True,
+        )
+        worker.start()
+
+    def _batch_worker(self):
+        result = retry_all_pending_auth_items(progress_callback)
+        message = (
+            "보류 전체 처리 완료 - "
+            f"성공 {result.get('success', 0)}개, "
+            f"실패 {result.get('failed', 0)}개, "
+            f"남음 {result.get('remaining', 0)}개"
+        )
+        if result.get("cancelled"):
+            message += " (사용자 인증 취소)"
+        self.batchFinished.emit(message)
+
+    def _on_batch_finished(self, message):
+        self._batch_running = False
+        self.batch_button.setEnabled(True)
+        self.retry_button.setEnabled(True)
+        self.status_label.setText(message)
+        self.refresh()
+
     def retry_selected(self):
         item_id, status = self._selected()
         if not item_id:
@@ -316,11 +389,3 @@ class PendingAuthPage(QObject):
         remove_pending_auth_item(item_id)
         self.refresh()
 
-    def _open_selected_url(self, *_args):
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        item = self.table.item(row, 5)
-        if item is None or not item.text().strip():
-            return
-        open_url(item.text().strip())
