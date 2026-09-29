@@ -21,6 +21,7 @@ from kudong import (
     progress_callback,
     queue_pending_auth_retry,
     remove_pending_auth_item,
+    reset_pending_auth_runtime_statuses,
     retry_pending_auth_item,
     set_pending_auth_changed_provider,
 )
@@ -85,6 +86,7 @@ class PendingAuthPage(QObject):
         super().__init__(MainWindow)
         self.MainWindow = MainWindow
         self.widgets = widgets
+        reset_pending_auth_runtime_statuses()
         self._build_menu_button()
         self._build_page()
 
