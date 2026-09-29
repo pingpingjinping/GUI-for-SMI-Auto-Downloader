@@ -168,4 +168,7 @@ class BrowserAuthBridge(QObject):
             )
             return None
 
-        return dialog.cookies
+        return {
+            "cookies": dialog.cookies,
+            "user_agent": self.profile.httpUserAgent(),
+        }
