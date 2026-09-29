@@ -75,6 +75,7 @@ jobs:
             "Qt6Qml.dll",
             "Qt6QmlModels.dll",
             "Qt6Quick.dll",
+            "Qt6QuickWidgets.dll",
             "Qt6WebChannel.dll",
             "Qt6WebEngineCore.dll",
             "Qt6WebEngineQuick.dll",
@@ -83,6 +84,7 @@ jobs:
             "QtGui.pyd",
             "QtWidgets.pyd",
             "QtNetwork.pyd",
+            "QtPrintSupport.pyd",
             "QtPositioning.pyd",
             "QtQml.pyd",
             "QtQmlModels.pyd",
@@ -123,6 +125,34 @@ jobs:
             }
           }
 
+      - name: Verify QtWebEngine runtime files
+        shell: pwsh
+        run: |
+          $buildDir = Get-ChildItem -Path build -Directory |
+            Where-Object { $_.Name -like "exe.*" } |
+            Select-Object -First 1
+
+          $pysideDir = Join-Path $buildDir.FullName "lib\PySide6"
+          $required = @(
+            "QtPrintSupport.pyd",
+            "Qt6PrintSupport.dll",
+            "Qt6QuickWidgets.dll",
+            "QtWebEngineCore.pyd",
+            "QtWebEngineWidgets.pyd",
+            "QtWebChannel.pyd",
+            "QtNetwork.pyd",
+            "QtPositioning.pyd",
+            "QtQml.pyd",
+            "QtQuick.pyd"
+          )
+
+          foreach ($name in $required) {
+            $path = Join-Path $pysideDir $name
+            if (-not (Test-Path $path)) {
+              throw "Required PySide6 WebEngine runtime file is missing: $path"
+            }
+          }
+
       - name: Smoke test frozen executable
         shell: pwsh
         run: |
@@ -137,6 +167,42 @@ jobs:
 
           if ($process.HasExited) {
             throw "Frozen executable exited during smoke test. ExitCode=$($process.ExitCode)"
+          }
+
+          $process.Refresh()
+          if ($process.MainWindowTitle -like "cx_Freeze:*") {
+            $dialogText = ""
+            try {
+              Add-Type -AssemblyName UIAutomationClient
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                $process.MainWindowTitle
+              )
+              $window = $root.FindFirst(
+                [System.Windows.Automation.TreeScope]::Children,
+                $nameCondition
+              )
+              if ($window) {
+                $items = $window.FindAll(
+                  [System.Windows.Automation.TreeScope]::Descendants,
+                  [System.Windows.Automation.Condition]::TrueCondition
+                )
+                $texts = @()
+                foreach ($item in $items) {
+                  $name = $item.Current.Name
+                  if ($name -and $name.Trim()) {
+                    $texts += $name.Trim()
+                  }
+                }
+                $dialogText = ($texts | Select-Object -Unique) -join " | "
+              }
+            } catch {
+              Write-Warning "Could not read cx_Freeze error dialog text: $_"
+            }
+
+            Stop-Process -Id $process.Id -Force
+            throw "Frozen executable opened a cx_Freeze startup error dialog: $($process.MainWindowTitle) :: $dialogText"
           }
 
           Stop-Process -Id $process.Id -Force
