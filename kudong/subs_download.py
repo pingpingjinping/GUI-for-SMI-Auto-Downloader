@@ -121,6 +121,20 @@ def get_pending_auth_items():
 def get_pending_auth_count():
     return len(get_pending_auth_items())
 
+def reset_pending_auth_runtime_statuses():
+    changed = False
+    with pending_auth_lock:
+        items = _load_pending_auth_unlocked()
+        for item in items:
+            if item.get("status") in ("queued", "authenticating"):
+                item["status"] = "pending"
+                changed = True
+        if changed:
+            _save_pending_auth_unlocked(items)
+    if changed:
+        _notify_pending_auth_changed()
+    return changed
+
 def _update_pending_auth_status(item_id, status):
     changed = False
     with pending_auth_lock:
