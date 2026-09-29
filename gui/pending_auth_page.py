@@ -25,8 +25,6 @@ from kudong import (
     retry_pending_auth_item,
     set_pending_auth_changed_provider,
 )
-from modules import UIFunctions
-
 
 class PendingMenuButton(QPushButton):
     def __init__(self, parent=None):
@@ -191,10 +189,8 @@ class PendingAuthPage(QObject):
     def open_page(self):
         self.refresh()
         self.widgets.stackedWidget.setCurrentWidget(self.page)
-        UIFunctions.resetStyle(self.MainWindow, "btn_pending")
-        self.menu_button.setStyleSheet(
-            UIFunctions.selectMenu(self.menu_button.styleSheet())
-        )
+        # 기존 프로젝트는 modules <-> main 순환 참조가 있어 이 동적
+        # 페이지에서는 UIFunctions를 직접 import하지 않습니다.
 
     def _status_text(self, value):
         return {
