@@ -101,6 +101,31 @@ class DownloadPage:
         )
         self.all_favorites_worker = None
 
+        # 과거 회차가 글별로 나뉘는 블로그를 한 번에 백필하는 옵션.
+        # 대량 다운로드에서는 추가 검색 요청이 생기므로 기본값은 OFF입니다.
+        self.widgets.history_backfill_checkbox = QCheckBox(self.widgets.row_2)
+        self.widgets.history_backfill_checkbox.setObjectName("history_backfill_checkbox")
+        self.widgets.history_backfill_checkbox.setText("과거 회차 자동 탐색")
+        self.widgets.history_backfill_checkbox.setToolTip(
+            "최신 자막 글만 등록된 경우 같은 블로그에서 이전 회차 글을 찾아 다운로드합니다."
+        )
+        self.widgets.gridLayout_2.addWidget(
+            self.widgets.history_backfill_checkbox, 1, 5, 1, 1
+        )
+
+        try:
+            with open("settings.yml", encoding="UTF8") as handle:
+                backfill_config = yaml.safe_load(handle) or {}
+            self.widgets.history_backfill_checkbox.setChecked(
+                bool(backfill_config.get("historical-backfill", False))
+            )
+        except Exception:
+            self.widgets.history_backfill_checkbox.setChecked(False)
+
+        self.widgets.history_backfill_checkbox.stateChanged.connect(
+            self.history_backfill_checkbox_changed
+        )
+
         common.downloadPage_instance = self # left_toggle_bar에서 Yml save 참조용
 
         with open('anime.yml', 'r', encoding='utf-8') as file:
@@ -145,6 +170,20 @@ class DownloadPage:
 
         self.timer = QTimer(self.MainWindow)
         self.timer.timeout.connect(self.scheduler_update)
+
+    def history_backfill_checkbox_changed(self, state):
+        try:
+            with open("settings.yml", encoding="UTF8") as handle:
+                config = yaml.safe_load(handle) or {}
+            config["historical-backfill"] = bool(state == Qt.CheckState.Checked.value)
+            with open("settings.yml", "w", encoding="utf-8") as handle:
+                yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            QMessageBox.warning(
+                self.MainWindow,
+                "SMI-DOWNLOADER",
+                "과거 회차 자동 탐색 설정을 저장하지 못했습니다.\n" + str(e),
+            )
 
     #테이블을 클릭했을떄
     def on_scheduler_cell_clicked(self, row, column):
