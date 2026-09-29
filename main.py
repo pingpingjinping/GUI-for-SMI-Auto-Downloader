@@ -31,6 +31,10 @@ class MainWindow(QMainWindow):
         # ///////////////////////////////////////////////////////////////
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+        # CAPTCHA / Cloudflare 수동 인증용 내장 브라우저 브리지
+        self.browser_auth_bridge = BrowserAuthBridge(self)
+        set_browser_auth_provider(self.browser_auth_bridge.request_auth)
         global widgets
         widgets = self.ui
 
