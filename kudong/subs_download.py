@@ -209,7 +209,10 @@ def print_log(log):
     console_output += log + "\n"
 
 HISTORY_SEARCH_MAX_PAGES = 4
-HISTORY_SEARCH_MAX_RESULTS = 60
+HISTORY_SEARCH_MAX_RESULTS = 200
+NAVER_HISTORY_SEARCH_MAX_PAGES = 10
+NAVER_HISTORY_STAGNANT_PAGE_LIMIT = 3
+NAVER_HISTORY_GAP_QUERY_LIMIT = 200
 
 
 def historical_backfill_enabled():
@@ -390,6 +393,39 @@ def _history_naver_post_url(blog_id, href):
     return None
 
 
+def _history_naver_result_text(anchor):
+    title = " ".join(anchor.stripped_strings).strip()
+    container = anchor.find_parent(["li", "article"])
+    if container is None:
+        container = anchor.find_parent("div")
+    if container is None:
+        return title
+    context = " ".join(container.stripped_strings).strip()
+    if title and title not in context:
+        context = title + " " + context
+    return context or title
+
+
+def _history_integer_episode(value):
+    number = _history_episode_number(value)
+    if number is None or number <= 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _history_naver_missing_episodes(rows, latest_episode):
+    latest = _history_integer_episode(latest_episode)
+    if latest is None or latest <= 1:
+        return []
+
+    found = set()
+    for row in rows:
+        episode = _history_integer_episode(row.get("episode"))
+        if episode is not None and episode < latest:
+            found.add(episode)
+    return [episode for episode in range(1, latest) if episode not in found]
+
+
 def _history_search_naver(source_url, anime_title, latest_episode):
     blog_id, _ = _naver_post_ids(source_url)
     if not blog_id:
@@ -397,40 +433,120 @@ def _history_search_naver(source_url, anime_title, latest_episode):
 
     out = []
     seen = set()
-    for page in range(1, HISTORY_SEARCH_MAX_PAGES + 1):
-        search_url = (
-            "https://m.blog.naver.com/PostSearchList.naver?"
-            + urllib.parse.urlencode({
-                "blogId": blog_id,
-                "searchText": anime_title,
-                "orderType": "sim",
-                "currentPage": page,
-                "countPerPage": 30,
-            })
-        )
-        try:
-            response = requests.get(
-                search_url,
-                headers=NAVER_REQUEST_HEADERS,
-                timeout=REQUEST_TIMEOUT,
+
+    def collect(search_text, max_pages, expected_episode=None, order_type="sim"):
+        stagnant_pages = 0
+
+        for page in range(1, max_pages + 1):
+            search_url = (
+                "https://m.blog.naver.com/PostSearchList.naver?"
+                + urllib.parse.urlencode({
+                    "blogId": blog_id,
+                    "searchText": search_text,
+                    "orderType": order_type,
+                    "currentPage": page,
+                    "countPerPage": 30,
+                })
             )
-            response.raise_for_status()
-        except Exception:
-            if page == 1:
-                return []
-            break
+            try:
+                response = requests.get(
+                    search_url,
+                    headers=NAVER_REQUEST_HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+            except Exception:
+                if page == 1:
+                    return
+                break
 
-        before = len(out)
-        soup = BeautifulSoup(response.text, "html.parser")
-        for anchor in soup.find_all("a", href=True):
-            href = _history_naver_post_url(blog_id, anchor.get("href", ""))
-            if not href:
-                continue
-            title = " ".join(anchor.stripped_strings).strip()
-            _history_add_candidate(out, seen, href, title, anime_title, latest_episode)
+            before = len(out)
+            soup = BeautifulSoup(response.text, "html.parser")
+            for anchor in soup.find_all("a", href=True):
+                href = _history_naver_post_url(blog_id, anchor.get("href", ""))
+                if not href or href in seen:
+                    continue
 
-        if len(out) == before and page > 1:
-            break
+                title = " ".join(anchor.stripped_strings).strip()
+                context = _history_naver_result_text(anchor)
+                episode = _history_extract_episode(title)
+                if episode is None:
+                    episode = _history_extract_episode(context)
+                episode_number = _history_integer_episode(episode)
+                if episode_number is None:
+                    continue
+
+                latest_number = _history_integer_episode(latest_episode)
+                if latest_number is not None and episode_number >= latest_number:
+                    continue
+                if expected_episode is not None and episode_number != expected_episode:
+                    continue
+
+                # NAVER search results sometimes use an English release title
+                # while the result snippet/body contains the Korean AniSSIA title.
+                # Accept either title or surrounding search-result context.
+                if not (
+                    _history_title_matches(title, anime_title)
+                    or _history_title_matches(context, anime_title)
+                ):
+                    continue
+
+                seen.add(href)
+                out.append({
+                    "url": href,
+                    "title": title or context,
+                    "episode": _history_episode_label(episode_number),
+                })
+                if len(out) >= HISTORY_SEARCH_MAX_RESULTS:
+                    return
+
+            if len(out) == before:
+                stagnant_pages += 1
+            else:
+                stagnant_pages = 0
+
+            # A single sparse/duplicate search page is common on NAVER.
+            # Only stop after several consecutive pages add nothing.
+            if page > 1 and stagnant_pages >= NAVER_HISTORY_STAGNANT_PAGE_LIMIT:
+                break
+
+    # First collect broad results in both relevance and date order. The old
+    # implementation used only 4 relevance pages and stopped after one page
+    # without a new candidate, which produced sparse lists such as
+    # 1, 13, 19, 24, 26... for a 48-episode series.
+    collect(anime_title, NAVER_HISTORY_SEARCH_MAX_PAGES, order_type="sim")
+    collect(anime_title, NAVER_HISTORY_SEARCH_MAX_PAGES, order_type="date")
+
+    # Use the AniSSIA latest episode as a completeness hint. For any integer
+    # episode still missing, issue a narrow one-page query for that episode.
+    # This is intentionally generic for every NAVER-backed title, not a
+    # title-specific workaround.
+    missing = _history_naver_missing_episodes(out, latest_episode)
+    if missing:
+        for episode in missing[:NAVER_HISTORY_GAP_QUERY_LIMIT]:
+            before = len(out)
+            collect(
+                f"{anime_title} {episode}화",
+                1,
+                expected_episode=episode,
+                order_type="sim",
+            )
+            if len(out) == before:
+                collect(
+                    f"{anime_title} {episode}",
+                    1,
+                    expected_episode=episode,
+                    order_type="sim",
+                )
+
+    remaining = _history_naver_missing_episodes(out, latest_episode)
+    if remaining:
+        preview = ", ".join(str(value) for value in remaining[:30])
+        if len(remaining) > 30:
+            preview += ", ..."
+        print_log(
+            f"[!] 네이버 과거 회차 누락 후보 {len(remaining)}개: {preview}화"
+        )
 
     return out
 
