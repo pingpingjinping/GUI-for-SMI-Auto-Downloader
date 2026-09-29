@@ -475,10 +475,7 @@ def _history_search_naver(source_url, anime_title, latest_episode):
                     continue
 
                 title = " ".join(anchor.stripped_strings).strip()
-                context = _history_naver_result_text(anchor)
                 episode = _history_extract_episode(title)
-                if episode is None:
-                    episode = _history_extract_episode(context)
                 episode_number = _history_integer_episode(episode)
                 if episode_number is None:
                     continue
@@ -489,13 +486,12 @@ def _history_search_naver(source_url, anime_title, latest_episode):
                 if expected_episode is not None and episode_number != expected_episode:
                     continue
 
-                # NAVER search results sometimes use an English release title
-                # while the result snippet/body contains the Korean AniSSIA title.
-                # Accept either title or surrounding search-result context.
-                if not (
-                    _history_title_matches(title, anime_title)
-                    or _history_title_matches(context, anime_title)
-                ):
+                # Do not accept a broad parent DIV as title evidence. NAVER
+                # search pages can place neighboring posts in the same DIV,
+                # which caused unrelated posts (e.g. Dragon Quest) to be
+                # backfilled into another anime. Only the linked post title
+                # itself is allowed to prove the anime match.
+                if not _history_title_matches(title, anime_title):
                     continue
 
                 seen.add(href)
@@ -1096,6 +1092,8 @@ def _naver_is_file_like_link(url):
         return True
     if "drive.google.com/file/d/" in lower_url:
         return True
+    if "drive.google.com/open" in lower_url and "id=" in parsed_url.query:
+        return True
     if "drive.google.com/uc" in lower_url:
         return True
     if "docs.google.com/uc" in lower_url:
@@ -1193,10 +1191,15 @@ def download_naver(url,callback):
                     else:
                         fileName = _naver_file_name(each_file)
 
-                    if fileName in ("uc", "download", ""):
-                        fileName = gdrive.get_file_name(each_file)
+                    if not fileName or not p_extension.match(fileName):
+                        try:
+                            drive_file_name = gdrive.get_file_name(each_file)
+                            if drive_file_name:
+                                fileName = drive_file_name
+                        except Exception as e:
+                            print_log("[=] Google Drive 파일명 조회 실패 : %s" % e)
 
-                    if not p_extension.match(fileName):
+                    if not fileName or not p_extension.match(fileName):
                         continue
 
                     print_log("  Link : %s" % each_file)
@@ -1400,6 +1403,8 @@ def _is_download_candidate_link(file_url):
         return True
     if "drive.google.com/file/d/" in decoded:
         return True
+    if "drive.google.com/open" in decoded and "id=" in parsed.query:
+        return True
     if "drive.google.com/uc" in decoded:
         return True
     if "docs.google.com/uc" in decoded:
@@ -1415,7 +1420,7 @@ def _normalize_google_drive_link(file_url):
         return file_url
 
     match = re.search(
-        r"drive\\.google\\.com/file/d/([^/?#]+)",
+        r"drive\.google\.com/file/d/([^/?#]+)",
         file_url,
         re.IGNORECASE,
     )
@@ -1423,13 +1428,16 @@ def _normalize_google_drive_link(file_url):
         return "https://drive.google.com/uc?id=" + match.group(1)
 
     parsed = urlparse(file_url)
-    id_match = re.search(r"(?:^|&)id=([^&]+)", parsed.query)
-    if id_match and (
-        "drive.google.com/uc" in file_url
-        or "docs.google.com/uc" in file_url
-        or "drive.usercontent.google.com/download" in file_url
+    host = (parsed.hostname or "").lower()
+    params = urllib.parse.parse_qs(parsed.query)
+    file_id = (params.get("id") or [""])[0]
+
+    if file_id and (
+        host == "drive.google.com"
+        or host == "docs.google.com"
+        or host == "drive.usercontent.google.com"
     ):
-        return "https://drive.google.com/uc?id=" + id_match.group(1)
+        return "https://drive.google.com/uc?id=" + file_id
 
     return file_url
 
@@ -1650,8 +1658,13 @@ def _download_detected_link(file_url, suggested_name, callback, session=None):
             parsed_url = urlparse(original_url)
             fileName = unquote(os.path.basename(parsed_url.path))
 
-    if is_google and fileName in ("uc", "download", ""):
-        fileName = gdrive.get_file_name(file_url)
+    if is_google and (not fileName or not p_extension.match(fileName)):
+        try:
+            drive_file_name = gdrive.get_file_name(file_url)
+            if drive_file_name:
+                fileName = drive_file_name
+        except Exception as e:
+            print_log("[=] Google Drive 파일명 조회 실패 : %s" % e)
 
     if not fileName or not p_extension.match(fileName):
         if session_response is not None:
