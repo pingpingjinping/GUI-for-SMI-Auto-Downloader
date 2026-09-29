@@ -17,6 +17,10 @@ build_exe_options = {
         "PySide6.QtWebEngineWidgets",
         "PySide6.QtWebChannel",
         "PySide6.QtNetwork",
+        "PySide6.QtPositioning",
+        "PySide6.QtQml",
+        "PySide6.QtQmlModels",
+        "PySide6.QtQuick",
     ],
     "excludes": [
         "tkinter", "matplotlib",
