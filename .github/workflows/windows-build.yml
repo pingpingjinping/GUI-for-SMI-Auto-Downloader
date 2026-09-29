@@ -83,6 +83,7 @@ jobs:
             "QtGui.pyd",
             "QtWidgets.pyd",
             "QtNetwork.pyd",
+            "QtPrintSupport.pyd",
             "QtPositioning.pyd",
             "QtQml.pyd",
             "QtQmlModels.pyd",
@@ -123,6 +124,30 @@ jobs:
             }
           }
 
+      - name: Verify QtWebEngine runtime files
+        shell: pwsh
+        run: |
+          $buildDir = Get-ChildItem -Path build -Directory |
+            Where-Object { $_.Name -like "exe.*" } |
+            Select-Object -First 1
+
+          $pysideDir = Join-Path $buildDir.FullName "lib\PySide6"
+          $required = @(
+            "QtPrintSupport.pyd",
+            "Qt6PrintSupport.dll",
+            "QtWebEngineCore.pyd",
+            "QtWebEngineWidgets.pyd",
+            "QtWebChannel.pyd",
+            "QtNetwork.pyd"
+          )
+
+          foreach ($name in $required) {
+            $path = Join-Path $pysideDir $name
+            if (-not (Test-Path $path)) {
+              throw "Required PySide6 WebEngine runtime file is missing: $path"
+            }
+          }
+
       - name: Smoke test frozen executable
         shell: pwsh
         run: |
@@ -137,6 +162,12 @@ jobs:
 
           if ($process.HasExited) {
             throw "Frozen executable exited during smoke test. ExitCode=$($process.ExitCode)"
+          }
+
+          $process.Refresh()
+          if ($process.MainWindowTitle -like "cx_Freeze:*") {
+            Stop-Process -Id $process.Id -Force
+            throw "Frozen executable opened a cx_Freeze startup error dialog: $($process.MainWindowTitle)"
           }
 
           Stop-Process -Id $process.Id -Force
