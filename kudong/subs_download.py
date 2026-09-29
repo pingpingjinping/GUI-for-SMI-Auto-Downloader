@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from urllib.parse import urljoin
 from datetime import datetime
 from bs4 import BeautifulSoup
+from kudong.winpng import extract_winpng_files
 
 #pip install gdown
 #pip install requests
@@ -1045,6 +1046,137 @@ def _article_links_with_tistory_fallback(url_source, page_url):
     return links
 
 
+WINPNG_SUPPORTED_EXTENSIONS = {
+    ".zip", ".ass", ".smi", ".sami", ".srt", ".7z", ".jmk"
+}
+
+
+def _tistory_winpng_image_urls(url_source, page_url):
+    # Harne's current subtitle posts distribute files inside PNG images.
+    # Other blogs are only scanned when the page explicitly references WinPNG.
+    host = (urlparse(page_url).hostname or "").lower()
+    if host != "harne1.tistory.com" and "winpng" not in url_source.lower():
+        return []
+
+    soup = BeautifulSoup(url_source, "html.parser")
+    containers = [
+        soup.select_one(".tt_article_useless_p_margin.contents_style"),
+        soup.select_one(".contents_style"),
+        soup.select_one(".entry-content"),
+        soup.select_one(".article-view"),
+        soup.select_one(".post-content"),
+        soup.find("article"),
+    ]
+    container = next((item for item in containers if item is not None), soup)
+
+    urls = []
+    seen = set()
+    for img in container.find_all("img"):
+        candidates = [
+            img.get("data-origin"),
+            img.get("data-original"),
+            img.get("data-src"),
+            img.get("src"),
+        ]
+
+        srcset = img.get("srcset")
+        if srcset:
+            for part in srcset.split(","):
+                candidates.append(part.strip().split(" ")[0])
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            image_url = urljoin(
+                page_url,
+                candidate.strip().replace("&amp;", "&"),
+            )
+            parsed = urlparse(image_url)
+            path = parsed.path.lower()
+
+            if not path.endswith(".png"):
+                continue
+
+            if image_url in seen:
+                continue
+            seen.add(image_url)
+            urls.append(image_url)
+
+    # Avoid spending a long time decoding skin icons or galleries on malformed
+    # pages. Harne subtitle posts normally expose one or a few content PNGs.
+    return urls[:12]
+
+
+def _safe_winpng_file_name(embedded_path):
+    name = os.path.basename(embedded_path.replace("\\", "/")).strip()
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    return name[:240]
+
+
+def _download_tistory_winpng(url_source, page_url, callback):
+    global download_progress_count
+
+    image_urls = _tistory_winpng_image_urls(url_source, page_url)
+    if not image_urls:
+        return False
+
+    request_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        ),
+        "Referer": page_url,
+    }
+
+    for image_url in image_urls:
+        try:
+            response = requests.get(
+                image_url,
+                headers=request_headers,
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+            response.raise_for_status()
+
+            embedded_files, mode = extract_winpng_files(response.content)
+            downloadable = []
+            for embedded in embedded_files:
+                file_name = _safe_winpng_file_name(embedded.path)
+                extension = os.path.splitext(file_name)[1].lower()
+                if not file_name or extension not in WINPNG_SUPPORTED_EXTENSIONS:
+                    continue
+                downloadable.append((file_name, embedded.data))
+
+            if not downloadable:
+                continue
+
+            path = outpath + smiDir
+            if not os.path.exists(path):
+                os.makedirs(path)
+
+            print_log("[+] WinPNG 검출 (%s)" % (mode or "unknown"))
+            print_log("  Image : %s" % image_url)
+
+            for file_name, file_data in downloadable:
+                with open(path + file_name, "wb") as output:
+                    output.write(file_data)
+
+                print_log("[=] WinPNG 추출 => " + file_name)
+                print_log("[+] 파일 다운로드가 완료 되었습니다. ")
+                download_progress_count += 1
+                callback(download_progress_count, download_progress_length)
+
+            return True
+
+        except Exception as e:
+            # A normal PNG is not an error. Continue until a real WinPNG image
+            # is found, and let the caller decide final failure status.
+            print_log("[=] WinPNG 후보 스킵 : %s" % e)
+
+    return False
+
+
 def _download_detected_link(file_url, suggested_name, callback):
     global download_progress_count
 
@@ -1119,11 +1251,6 @@ def download_tistory(url,callback):
                 candidates.insert(0, (old_url, ""))
                 seen.add(old_url)
 
-        if not candidates:
-            print_log("[-] Attached File not found !!")
-            isDownloadError = 1
-            return
-
         for each_file, suggested_name in candidates:
             try:
                 if _download_detected_link(each_file, suggested_name, callback):
@@ -1137,6 +1264,12 @@ def download_tistory(url,callback):
                 print_log(traceback.format_exc())
                 isDownloadError = 1
                 download_progress_count += 1
+
+        # Harne and newer WinPNG-based Tistory posts may intentionally expose
+        # no ordinary attachment link. Decode the content PNG itself.
+        if file_found == 0:
+            if _download_tistory_winpng(url_source, url, callback):
+                file_found = 1
 
         if file_found == 0:
             print_log("[-] Attached File not found !!")
@@ -1165,7 +1298,13 @@ def download_count_tistory(url):
             old_url = urljoin(url, old_url.replace("&amp;", "&"))
             seen.add(old_url)
 
-        return len(seen)
+        if seen:
+            return len(seen)
+
+        if _tistory_winpng_image_urls(url_source, url):
+            return 1
+
+        return 0
     except Exception:
         return 0
 
