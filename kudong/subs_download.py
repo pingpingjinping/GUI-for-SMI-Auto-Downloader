@@ -1911,8 +1911,12 @@ def _is_browser_challenge_response(response):
     if response.status_code in (403, 429, 503):
         return True
 
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if "html" not in content_type and "json" not in content_type and "text/" not in content_type:
+        return False
+
     try:
-        body = (response.text or "").lower()
+        body = (response.text or "")[:500000].lower()
     except Exception:
         body = ""
 
@@ -1926,9 +1930,11 @@ def _is_browser_challenge_response(response):
     return any(marker in body for marker in markers)
 
 
-def _session_from_browser_cookies(cookies):
+def _session_from_browser_cookies(cookies, user_agent=None):
     session = requests.Session()
     session.headers.update(HEADERS)
+    if user_agent:
+        session.headers["User-Agent"] = user_agent
 
     for cookie in cookies or []:
         name = cookie.get("name")
@@ -1955,14 +1961,25 @@ def _request_browser_authenticated_session(url):
         return None
 
     print_log("[!] CAPTCHA / Cloudflare 사용자 인증이 필요합니다.")
-    cookies = browser_auth_provider(url)
+    auth_result = browser_auth_provider(url)
 
-    if not cookies:
+    if not auth_result:
         print_log("[=] 사용자 인증이 취소되었습니다.")
         return None
 
+    if isinstance(auth_result, dict):
+        cookies = auth_result.get("cookies")
+        user_agent = auth_result.get("user_agent")
+    else:
+        cookies = auth_result
+        user_agent = None
+
+    if not cookies:
+        print_log("[=] 브라우저 인증 쿠키를 확인하지 못했습니다.")
+        return None
+
     print_log("[+] 브라우저 인증 정보를 가져왔습니다. 다운로드를 다시 시도합니다.")
-    return _session_from_browser_cookies(cookies)
+    return _session_from_browser_cookies(cookies, user_agent=user_agent)
 
 
 def _erulabo_page(session, url):
