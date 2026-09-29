@@ -9,6 +9,7 @@ import threading
 import natsort
 import gdrive
 import urllib.error
+import urllib.parse
 from http import client
 from urllib import request
 from urllib.request import urlopen
@@ -207,6 +208,300 @@ def print_log(log):
     global console_output
     console_output += log + "\n"
 
+HISTORY_SEARCH_MAX_PAGES = 4
+HISTORY_SEARCH_MAX_RESULTS = 60
+
+
+def historical_backfill_enabled():
+    try:
+        with open("settings.yml", encoding="UTF8") as handle:
+            config = yaml.safe_load(handle) or {}
+        return bool(config.get("historical-backfill", False))
+    except Exception:
+        return False
+
+
+def _history_episode_number(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_episode_label(value):
+    number = _history_episode_number(value)
+    if number is None:
+        return str(value or "").strip()
+    if number.is_integer():
+        return str(int(number))
+    return ("%s" % number).rstrip("0").rstrip(".")
+
+
+def _history_extract_episode(text):
+    text = str(text or "")
+    patterns = [
+        r"(?<!\d)(\d{1,3}(?:\.\d+)?)\s*(?:화|話|회)",
+        r"\b(?:ep|episode)\s*[\.\-_:：#]?\s*0*(\d{1,3}(?:\.\d+)?)\b",
+        r"(?:제|第)\s*(\d{1,3}(?:\.\d+)?)\s*(?:화|話|회)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _history_episode_number(match.group(1))
+    return None
+
+
+def _history_normalize_title(value):
+    value = unquote(str(value or "")).lower()
+    value = re.sub(r"\s*(?:\d+\s*기|\d+(?:st|nd|rd|th)\s*season|season\s*\d+)\s*$", "", value, flags=re.I)
+    return re.sub(r"[^0-9a-z가-힣ぁ-んァ-ヶ一-龯]+", "", value)
+
+
+def _history_title_matches(result_title, anime_title):
+    result = _history_normalize_title(result_title)
+    wanted = _history_normalize_title(anime_title)
+    if not result or not wanted:
+        return False
+    if wanted in result or result in wanted:
+        return True
+
+    # Search result titles often omit a trailing season marker. Requiring a
+    # reasonably long shared core keeps unrelated posts on the same blog out.
+    if len(wanted) >= 8:
+        core = wanted[: max(8, int(len(wanted) * 0.7))]
+        return core in result
+    return False
+
+
+def _history_candidate(url, title, anime_title, latest_episode):
+    episode = _history_extract_episode(title)
+    if episode is None:
+        return None
+    if latest_episode is not None:
+        if episode >= latest_episode or episode <= 0:
+            return None
+    elif episode <= 0:
+        return None
+    if not _history_title_matches(title, anime_title):
+        return None
+    return {
+        "url": url,
+        "title": title,
+        "episode": _history_episode_label(episode),
+    }
+
+
+def _history_add_candidate(out, seen, url, title, anime_title, latest_episode):
+    if not url or url in seen or len(out) >= HISTORY_SEARCH_MAX_RESULTS:
+        return
+    candidate = _history_candidate(url, title, anime_title, latest_episode)
+    if candidate is None:
+        return
+    seen.add(url)
+    out.append(candidate)
+
+
+def _history_search_tistory(source_url, anime_title, latest_episode):
+    parsed = urlparse(source_url)
+    host = parsed.netloc.lower()
+    if not host:
+        return []
+
+    out = []
+    seen = set()
+    query = quote(anime_title, safe="")
+    headers = {"User-Agent": HEADERS["User-Agent"], "Accept-Language": HEADERS["Accept-Language"]}
+
+    for page in range(1, HISTORY_SEARCH_MAX_PAGES + 1):
+        search_url = f"{parsed.scheme or 'https'}://{host}/search/{query}?page={page}"
+        try:
+            response = requests.get(search_url, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+        except Exception:
+            if page == 1:
+                return []
+            break
+
+        before = len(out)
+        soup = BeautifulSoup(response.text, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = urljoin(search_url, anchor.get("href", ""))
+            target = urlparse(href)
+            if target.netloc.lower() != host:
+                continue
+            if re.fullmatch(r"/\d+/?", target.path or "") is None:
+                continue
+            title = " ".join(anchor.stripped_strings).strip()
+            _history_add_candidate(out, seen, href, title, anime_title, latest_episode)
+
+        if len(out) == before and page > 1:
+            break
+
+    return out
+
+
+def _history_search_blogspot(source_url, anime_title, latest_episode):
+    parsed = urlparse(source_url)
+    host = parsed.netloc.lower()
+    if not host:
+        return []
+
+    search_url = (
+        f"{parsed.scheme or 'https'}://{host}/search?"
+        + urllib.parse.urlencode({"q": anime_title, "max-results": 50})
+    )
+    try:
+        response = requests.get(
+            search_url,
+            headers={"User-Agent": HEADERS["User-Agent"], "Accept-Language": HEADERS["Accept-Language"]},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    out = []
+    seen = set()
+    soup = BeautifulSoup(response.text, "html.parser")
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(search_url, anchor.get("href", ""))
+        target = urlparse(href)
+        if target.netloc.lower() != host:
+            continue
+        if re.search(r"/\d{4}/\d{2}/.+\.html$", target.path or "", re.I) is None:
+            continue
+        title = " ".join(anchor.stripped_strings).strip()
+        _history_add_candidate(out, seen, href, title, anime_title, latest_episode)
+    return out
+
+
+def _history_naver_post_url(blog_id, href):
+    absolute = urljoin("https://m.blog.naver.com", href or "")
+    parsed = urlparse(absolute)
+    match = re.search(r"/([^/?#]+)/(\d+)", parsed.path or "")
+    if match:
+        return f"https://blog.naver.com/{match.group(1)}/{match.group(2)}"
+
+    params = urllib.parse.parse_qs(parsed.query)
+    log_no = (params.get("logNo") or params.get("logno") or [""])[0]
+    item_blog_id = (params.get("blogId") or params.get("blogid") or [blog_id])[0]
+    if item_blog_id and str(log_no).isdigit():
+        return f"https://blog.naver.com/{item_blog_id}/{log_no}"
+    return None
+
+
+def _history_search_naver(source_url, anime_title, latest_episode):
+    blog_id, _ = _naver_post_ids(source_url)
+    if not blog_id:
+        return []
+
+    out = []
+    seen = set()
+    for page in range(1, HISTORY_SEARCH_MAX_PAGES + 1):
+        search_url = (
+            "https://m.blog.naver.com/PostSearchList.naver?"
+            + urllib.parse.urlencode({
+                "blogId": blog_id,
+                "searchText": anime_title,
+                "orderType": "sim",
+                "currentPage": page,
+                "countPerPage": 30,
+            })
+        )
+        try:
+            response = requests.get(
+                search_url,
+                headers=NAVER_REQUEST_HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+        except Exception:
+            if page == 1:
+                return []
+            break
+
+        before = len(out)
+        soup = BeautifulSoup(response.text, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = _history_naver_post_url(blog_id, anchor.get("href", ""))
+            if not href:
+                continue
+            title = " ".join(anchor.stripped_strings).strip()
+            _history_add_candidate(out, seen, href, title, anime_title, latest_episode)
+
+        if len(out) == before and page > 1:
+            break
+
+    return out
+
+
+def _history_find_posts(source_url, anime_title, latest_episode):
+    lower = unquote(source_url or "").lower()
+    if "tistory" in lower:
+        return _history_search_tistory(source_url, anime_title, latest_episode)
+    if "blogspot" in lower:
+        return _history_search_blogspot(source_url, anime_title, latest_episode)
+    if "naver" in lower:
+        return _history_search_naver(source_url, anime_title, latest_episode)
+    return []
+
+
+def expand_historical_captions(json_data):
+    if not historical_backfill_enabled():
+        return json_data
+
+    expanded = []
+    seen = set()
+
+    for current in json_data:
+        current_url = unquote(str(current.get("website") or "")).strip()
+        current_episode = _history_episode_number(current.get("episode"))
+        creator = str(current.get("name") or "")
+        history_rows = []
+
+        if current_url and current_episode is not None and current_episode > 1:
+            try:
+                history_rows = _history_find_posts(current_url, AnimeName, current_episode)
+            except Exception as exc:
+                print_log(f"[-] 과거 회차 탐색 실패 ({creator}) : {exc}")
+
+        if history_rows:
+            history_rows.sort(key=lambda row: _history_episode_number(row["episode"]) or 0)
+            print_log(
+                f"[=] 과거 회차 탐색 ({creator}) : {len(history_rows)}개 발견 "
+                f"(1화 ~ {history_rows[-1]['episode']}화 후보)"
+            )
+
+        for row in history_rows:
+            key = (creator, row["episode"], row["url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append({
+                "name": creator,
+                "episode": row["episode"],
+                "updDt": str(current.get("updDt") or ""),
+                "website": row["url"],
+                "_historical_backfill": True,
+                "_historical_title": row["title"],
+            })
+
+        key = (
+            creator,
+            str(current.get("episode") or ""),
+            current_url,
+        )
+        if key not in seen:
+            seen.add(key)
+            expanded.append(current)
+
+    if len(expanded) != len(json_data):
+        print_log(
+            f"[=] 과거 회차 자동 탐색으로 {len(expanded) - len(json_data)}개 항목을 추가했습니다."
+        )
+    return expanded
+
+
 # 요청함수
 
 def requestAnimeSMI_3(anime,callback):
@@ -245,6 +540,7 @@ def requestAnimeSMI(AnimeNo,callback):
 
     datas = json.loads(response.text)
     json_data = datas["data"]
+    json_data = expand_historical_captions(json_data)
 
     #다운로드 사이즈 체크
 
@@ -329,6 +625,7 @@ def requestMultipleAnimeSMI(callback):
 
                 datas = response.json()
                 json_data = datas.get("data", [])
+                json_data = expand_historical_captions(json_data)
 
                 if not json_data:
                     print_log("[=] 등록된 자막 정보가 없습니다.")
