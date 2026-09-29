@@ -6,6 +6,8 @@ import os
 import yaml
 import traceback
 import threading
+import time
+import uuid
 import natsort
 import gdrive
 import urllib.error
@@ -71,10 +73,190 @@ DOWNLOAD_TIMEOUT = 20
 
 # GUI가 제공하는 수동 CAPTCHA 인증 함수. CLI/비-GUI 환경에서는 None입니다.
 browser_auth_provider = None
+pending_auth_changed_provider = None
+browser_auth_interactive = False
+current_caption_context = None
+pending_auth_lock = threading.Lock()
 
 def set_browser_auth_provider(provider):
     global browser_auth_provider
     browser_auth_provider = provider
+
+def set_pending_auth_changed_provider(provider):
+    global pending_auth_changed_provider
+    pending_auth_changed_provider = provider
+
+def _pending_auth_file():
+    return os.path.abspath(".") + "/pending_auth.json"
+
+def _notify_pending_auth_changed():
+    if pending_auth_changed_provider is not None:
+        try:
+            pending_auth_changed_provider()
+        except Exception:
+            pass
+
+def _load_pending_auth_unlocked():
+    path = _pending_auth_file()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _save_pending_auth_unlocked(items):
+    path = _pending_auth_file()
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(items, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+def get_pending_auth_items():
+    with pending_auth_lock:
+        return [dict(item) for item in _load_pending_auth_unlocked()]
+
+def get_pending_auth_count():
+    return len(get_pending_auth_items())
+
+def _update_pending_auth_status(item_id, status):
+    changed = False
+    with pending_auth_lock:
+        items = _load_pending_auth_unlocked()
+        for item in items:
+            if item.get("id") == item_id:
+                item["status"] = status
+                changed = True
+                break
+        if changed:
+            _save_pending_auth_unlocked(items)
+    if changed:
+        _notify_pending_auth_changed()
+    return changed
+
+def remove_pending_auth_item(item_id):
+    changed = False
+    with pending_auth_lock:
+        items = _load_pending_auth_unlocked()
+        new_items = [item for item in items if item.get("id") != item_id]
+        changed = len(new_items) != len(items)
+        if changed:
+            _save_pending_auth_unlocked(new_items)
+    if changed:
+        _notify_pending_auth_changed()
+    return changed
+
+def queue_pending_auth_retry(item_id):
+    return _update_pending_auth_status(item_id, "queued")
+
+def _enqueue_current_pending_auth(url, reason):
+    context = current_caption_context or {}
+    caption = dict(context.get("caption") or {})
+    anime_no = context.get("animeNo", AnimeNO)
+    anime_name = context.get("animeName", AnimeName)
+    creator = caption.get("name", "")
+    episode = caption.get("episode", "")
+    website = unquote(caption.get("website", "") or url or "")
+
+    if not website:
+        website = url or ""
+
+    changed = False
+    with pending_auth_lock:
+        items = _load_pending_auth_unlocked()
+        existing = None
+        for item in items:
+            if (
+                str(item.get("animeNo", "")) == str(anime_no)
+                and item.get("animeName", "") == anime_name
+                and item.get("creator", "") == creator
+                and str(item.get("episode", "")) == str(episode)
+                and item.get("website", "") == website
+            ):
+                existing = item
+                break
+
+        now = datetime.now().isoformat(timespec="seconds")
+        if existing is None:
+            items.append({
+                "id": uuid.uuid4().hex,
+                "status": "pending",
+                "animeNo": anime_no,
+                "animeName": anime_name,
+                "creator": creator,
+                "episode": episode,
+                "website": website,
+                "reason": reason or "CAPTCHA / Cloudflare verification required",
+                "detectedAt": now,
+                "caption": caption,
+            })
+            changed = True
+        else:
+            existing["reason"] = reason or existing.get("reason", "")
+            existing["detectedAt"] = now
+            if existing.get("status") not in ("queued", "authenticating"):
+                existing["status"] = "pending"
+            changed = True
+
+        if changed:
+            _save_pending_auth_unlocked(items)
+
+    if changed:
+        _notify_pending_auth_changed()
+    return changed
+
+def retry_pending_auth_item(item_id, callback):
+    global browser_auth_interactive, AnimeName, AnimeNO, console_output
+
+    item = next((x for x in get_pending_auth_items() if x.get("id") == item_id), None)
+    if item is None:
+        return False
+
+    # "다음 차례" 동작: 현재 다운로드가 끝날 때까지 기다렸다가
+    # scheduler lock을 획득한 즉시 이 항목을 실행합니다.
+    while not lock_Scheduler():
+        time.sleep(0.5)
+
+    try:
+        _update_pending_auth_status(item_id, "authenticating")
+        browser_auth_interactive = True
+        AnimeName = item.get("animeName") or "None"
+        AnimeNO = item.get("animeNo", -1)
+        caption = dict(item.get("caption") or {})
+        if not caption:
+            _update_pending_auth_status(item_id, "pending")
+            return False
+
+        console_output = ""
+        if not os.path.exists(log_path):
+            os.makedirs(log_path)
+        new_filename = get_new_log_file()
+
+        callback(0, 1, "<" + AnimeName + "> 보류 항목 재시도...")
+        _requestAnimeSMI(AnimeNO, callback, new_filename, [caption])
+
+        if isDownloadError == 0:
+            remove_pending_auth_item(item_id)
+            callback(1, 1, "<" + AnimeName + "> 보류 항목 다운로드 완료", True)
+            return True
+
+        _update_pending_auth_status(item_id, "pending")
+        callback(1, 1, "<" + AnimeName + "> 보류 항목 재시도 실패", True)
+        return False
+    except Exception as e:
+        print_log("[-] 보류 항목 재시도 오류 : %s" % e)
+        print_log(traceback.format_exc())
+        _update_pending_auth_status(item_id, "pending")
+        try:
+            callback(1, 1, "<" + (item.get("animeName") or "작품") + "> 보류 항목 재시도 실패", True)
+        except Exception:
+            pass
+        return False
+    finally:
+        browser_auth_interactive = False
+        unlock_Scheduler()
 
 def init_paths(autoPath):
     global outpath, log_path
@@ -804,7 +986,7 @@ def requestMultipleAnimeSMI(callback):
 
 
 def _requestAnimeSMI(AnimeNo,callback,new_filename,json_data):
-    global AnimeName,smiDir,isDownloadError,download_progress_count,download_progress_length,console_output
+    global AnimeName,smiDir,isDownloadError,download_progress_count,download_progress_length,console_output,current_caption_context
 
     for k in json_data:
         
@@ -817,6 +999,11 @@ def _requestAnimeSMI(AnimeNo,callback,new_filename,json_data):
         episode = k['episode']
         updDt = k['updDt']
         website = unquote(k['website'])
+        current_caption_context = {
+            "animeNo": AnimeNo,
+            "animeName": AnimeName,
+            "caption": dict(k),
+        }
 
         callback(download_progress_count,download_progress_length,"<"+AnimeName+"> 다운로드중...")
         print_log("다운로드 진행상황 => "+str(download_progress_count)+"/"+str(download_progress_length))
@@ -1968,12 +2155,21 @@ def _session_from_browser_cookies(cookies, user_agent=None):
     return session
 
 
-def _request_browser_authenticated_session(url):
+def _request_browser_authenticated_session(url, reason=None):
+    if not browser_auth_interactive:
+        _enqueue_current_pending_auth(
+            url,
+            reason or "CAPTCHA / Cloudflare verification required",
+        )
+        print_log("[!] CAPTCHA / Cloudflare 인증 항목을 보류목록에 추가했습니다.")
+        print_log("[=] 인증창은 열지 않고 다음 다운로드로 계속 진행합니다.")
+        return None
+
     if browser_auth_provider is None:
         print_log("[-] 사용자 인증이 필요하지만 내장 브라우저를 사용할 수 없습니다.")
         return None
 
-    print_log("[!] CAPTCHA / Cloudflare 사용자 인증이 필요합니다.")
+    print_log("[!] 보류 항목 사용자 인증을 시작합니다.")
     auth_result = browser_auth_provider(url)
 
     if not auth_result:
@@ -2104,8 +2300,8 @@ def download_erulabo(url, callback):
     try:
         try:
             page_response = _erulabo_page(session, url)
-        except BrowserAuthRequired:
-            session = _request_browser_authenticated_session(url)
+        except BrowserAuthRequired as e:
+            session = _request_browser_authenticated_session(url, reason=str(e))
             if session is None:
                 isDownloadError = 1
                 return
@@ -2141,8 +2337,8 @@ def find_blog_1(temps, url, callback, session=None):
         try:
             try:
                 download_url = _erulabo_download_url(session, url, each_file)
-            except BrowserAuthRequired:
-                session = _request_browser_authenticated_session(url)
+            except BrowserAuthRequired as e:
+                session = _request_browser_authenticated_session(url, reason=str(e))
                 if session is None:
                     isDownloadError = 1
                     return 0
@@ -2177,8 +2373,13 @@ def find_blog_1(temps, url, callback, session=None):
             ):
                 return 1
 
-        except BrowserAuthRequired:
-            print_log("[-] 다운로드 단계에서 사용자 인증이 다시 필요합니다.")
+        except BrowserAuthRequired as e:
+            if not browser_auth_interactive:
+                _enqueue_current_pending_auth(url, str(e))
+                print_log("[!] 다운로드 단계의 인증 항목을 보류목록에 추가했습니다.")
+                print_log("[=] 다음 다운로드로 계속 진행합니다.")
+            else:
+                print_log("[-] 인증 후에도 다운로드 단계에서 사용자 인증이 다시 필요합니다.")
             isDownloadError = 1
             return 0
         except urllib.error.HTTPError as e:
