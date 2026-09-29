@@ -138,7 +138,11 @@ jobs:
             "QtWebEngineCore.pyd",
             "QtWebEngineWidgets.pyd",
             "QtWebChannel.pyd",
-            "QtNetwork.pyd"
+            "QtNetwork.pyd",
+            "QtPositioning.pyd",
+            "QtQml.pyd",
+            "QtQmlModels.pyd",
+            "QtQuick.pyd"
           )
 
           foreach ($name in $required) {
@@ -166,8 +170,38 @@ jobs:
 
           $process.Refresh()
           if ($process.MainWindowTitle -like "cx_Freeze:*") {
+            $dialogText = ""
+            try {
+              Add-Type -AssemblyName UIAutomationClient
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $nameCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                $process.MainWindowTitle
+              )
+              $window = $root.FindFirst(
+                [System.Windows.Automation.TreeScope]::Children,
+                $nameCondition
+              )
+              if ($window) {
+                $items = $window.FindAll(
+                  [System.Windows.Automation.TreeScope]::Descendants,
+                  [System.Windows.Automation.Condition]::TrueCondition
+                )
+                $texts = @()
+                foreach ($item in $items) {
+                  $name = $item.Current.Name
+                  if ($name -and $name.Trim()) {
+                    $texts += $name.Trim()
+                  }
+                }
+                $dialogText = ($texts | Select-Object -Unique) -join " | "
+              }
+            } catch {
+              Write-Warning "Could not read cx_Freeze error dialog text: $_"
+            }
+
             Stop-Process -Id $process.Id -Force
-            throw "Frozen executable opened a cx_Freeze startup error dialog: $($process.MainWindowTitle)"
+            throw "Frozen executable opened a cx_Freeze startup error dialog: $($process.MainWindowTitle) :: $dialogText"
           }
 
           Stop-Process -Id $process.Id -Force
