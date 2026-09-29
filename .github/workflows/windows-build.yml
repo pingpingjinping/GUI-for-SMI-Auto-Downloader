@@ -31,7 +31,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install cx_Freeze "PySide6-Essentials==6.7.2" requests PyYAML beautifulsoup4 natsort tqdm certifi
+          python -m pip install cx_Freeze "PySide6-Essentials==6.7.2" "PySide6-Addons==6.7.2" requests PyYAML beautifulsoup4 natsort tqdm certifi
 
       - name: Prepare runtime folders
         shell: pwsh
@@ -63,15 +63,34 @@ jobs:
             throw "PySide6 runtime directory was not found."
           }
 
-          # The app imports only QtCore, QtGui and QtWidgets.
-          # Keep the binding runtime and remove unrelated Qt modules copied by cx_Freeze.
+          # Keep the Widgets runtime plus the QtWebEngine dependencies used by the CAPTCHA browser.
           $keepRootFiles = @(
             "Qt6Core.dll",
             "Qt6Gui.dll",
             "Qt6Widgets.dll",
+            "Qt6Network.dll",
+            "Qt6OpenGL.dll",
+            "Qt6Positioning.dll",
+            "Qt6PrintSupport.dll",
+            "Qt6Qml.dll",
+            "Qt6QmlModels.dll",
+            "Qt6Quick.dll",
+            "Qt6WebChannel.dll",
+            "Qt6WebEngineCore.dll",
+            "Qt6WebEngineQuick.dll",
+            "Qt6WebEngineWidgets.dll",
             "QtCore.pyd",
             "QtGui.pyd",
             "QtWidgets.pyd",
+            "QtNetwork.pyd",
+            "QtPositioning.pyd",
+            "QtQml.pyd",
+            "QtQmlModels.pyd",
+            "QtQuick.pyd",
+            "QtWebChannel.pyd",
+            "QtWebEngineCore.pyd",
+            "QtWebEngineWidgets.pyd",
+            "QtWebEngineProcess.exe",
             "pyside6.abi3.dll",
             "__init__.pyc",
             "_cx_freeze_debug.pyc"
@@ -81,8 +100,8 @@ jobs:
             Where-Object { $_.Name -notin $keepRootFiles } |
             Remove-Item -Force
 
-          # QML, translations and development/runtime extras are not used by this Widgets app.
-          @("qml", "translations", "include", "typesystems", "glue", "scripts") | ForEach-Object {
+          # QML UI modules and development extras are not used. Keep translations/resources for WebEngine.
+          @("qml", "include", "typesystems", "glue", "scripts") | ForEach-Object {
             $path = Join-Path $pysideDir $_
             if (Test-Path $path) {
               Remove-Item $path -Recurse -Force
@@ -93,7 +112,7 @@ jobs:
           $pluginsDir = Join-Path $pysideDir "plugins"
           if (Test-Path $pluginsDir) {
             Get-ChildItem $pluginsDir -Directory |
-              Where-Object { $_.Name -notin @("platforms", "imageformats", "styles") } |
+              Where-Object { $_.Name -notin @("platforms", "imageformats", "styles", "tls", "networkinformation") } |
               Remove-Item -Recurse -Force
 
             $platformsDir = Join-Path $pluginsDir "platforms"
