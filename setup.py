@@ -8,6 +8,16 @@ files = ['icon.ico', 'themes/', 'anime.yml', 'settings.yml', 'downloads/', 'log'
 
 # ADD PACKAGE
 build_exe_options = {
+    # QtWebEngine loads several Qt modules dynamically at runtime. cx_Freeze
+    # does not always discover them from the direct imports, so include them
+    # explicitly to avoid startup errors such as missing QtPrintSupport.
+    "includes": [
+        "PySide6.QtPrintSupport",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebChannel",
+        "PySide6.QtNetwork",
+    ],
     "excludes": [
         "tkinter", "matplotlib",
         # 불필요한 Qt 모듈 (프로젝트는 QtCore, QtGui, QtWidgets만 사용)
