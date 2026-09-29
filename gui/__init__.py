@@ -6,3 +6,5 @@ from .search_page import *
 from .tray import *
 from .recent_page import *
 from .browser_auth import *
+
+from .pending_auth_page import *

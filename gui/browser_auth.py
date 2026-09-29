@@ -10,15 +10,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QVBoxLayout,
 )
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-
-
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
 
 
 class CaptchaAuthDialog(QDialog):
@@ -45,6 +38,19 @@ class CaptchaAuthDialog(QDialog):
 
         self.browser = QWebEngineView(self)
         self.page = QWebEnginePage(self.profile, self.browser)
+
+        # Cloudflare Turnstile is sensitive to WebView capabilities and UA
+        # consistency. Use QtWebEngine's real UA instead of spoofing another
+        # Chrome version, and explicitly enable the browser features Turnstile
+        # expects from embedded WebViews.
+        settings = self.page.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows,
+            True,
+        )
+
         self.browser.setPage(self.page)
         self.browser.setUrl(QUrl(url))
         layout.addWidget(self.browser, 1)
@@ -127,10 +133,18 @@ class BrowserAuthBridge(QObject):
         self.profile = QWebEngineProfile("smi-captcha-auth", self)
         self.profile.setPersistentStoragePath(profile_dir)
         self.profile.setCachePath(os.path.join(profile_dir, "cache"))
-        self.profile.setHttpUserAgent(BROWSER_USER_AGENT)
+        self.profile.setHttpAcceptLanguage("ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+
+        # Keep QtWebEngine's native user agent. Spoofing a newer Chrome UA
+        # while running an older embedded Chromium engine can cause Turnstile
+        # to classify the browser as unsupported or inconsistent.
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
         )
+
+        # Drop stale challenge resources while preserving persistent cookies.
+        # This avoids reusing a cached Turnstile error page after an app update.
+        self.profile.clearHttpCache()
 
         self.authRequested.connect(self._open_auth_dialog)
 

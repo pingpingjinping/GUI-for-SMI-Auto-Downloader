@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
         self.search_page = SearchPage(self,widgets)
         # 최근 자막 페이지
         self.recent_page = RecentPage(self,widgets)
+        # CAPTCHA / Cloudflare 보류 목록
+        self.pending_auth_page = PendingAuthPage(self,widgets)
 
         # BUTTONS CLICK
         # ///////////////////////////////////////////////////////////////
