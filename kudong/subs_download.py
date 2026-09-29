@@ -69,6 +69,13 @@ quitSignal = False
 REQUEST_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 20
 
+# GUI가 제공하는 수동 CAPTCHA 인증 함수. CLI/비-GUI 환경에서는 None입니다.
+browser_auth_provider = None
+
+def set_browser_auth_provider(provider):
+    global browser_auth_provider
+    browser_auth_provider = provider
+
 def init_paths(autoPath):
     global outpath, log_path
     log_path = os.path.abspath('.') + "/log/"
@@ -1590,7 +1597,21 @@ def _download_tistory_winpng(url_source, page_url, callback):
     return False
 
 
-def _download_detected_link(file_url, suggested_name, callback):
+def _requests_response_filename(response):
+    disposition = response.headers.get("Content-Disposition", "")
+
+    match = re.search(r"filename\\*=UTF-8''([^;]+)", disposition, re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+
+    match = re.search(r'filename="?([^";]+)"?', disposition, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def _download_detected_link(file_url, suggested_name, callback, session=None):
     global download_progress_count
 
     original_url = file_url
@@ -1601,8 +1622,20 @@ def _download_detected_link(file_url, suggested_name, callback):
         or "drive.usercontent.google.com/download" in file_url
     )
 
-    remotefile = urlopen(file_url, timeout=REQUEST_TIMEOUT)
-    fileName = remotefile.headers.get_filename()
+    session_response = None
+    if session is not None and not is_google:
+        session_response = session.get(
+            file_url,
+            timeout=DOWNLOAD_TIMEOUT,
+            stream=True,
+        )
+        if _is_browser_challenge_response(session_response):
+            raise BrowserAuthRequired("download endpoint requires browser verification")
+        session_response.raise_for_status()
+        fileName = _requests_response_filename(session_response)
+    else:
+        remotefile = urlopen(file_url, timeout=REQUEST_TIMEOUT)
+        fileName = remotefile.headers.get_filename()
 
     if fileName is not None:
         try:
@@ -1621,6 +1654,8 @@ def _download_detected_link(file_url, suggested_name, callback):
         fileName = gdrive.get_file_name(file_url)
 
     if not fileName or not p_extension.match(fileName):
+        if session_response is not None:
+            session_response.close()
         return False
 
     print_log("  Link : %s" % file_url)
@@ -1632,6 +1667,12 @@ def _download_detected_link(file_url, suggested_name, callback):
 
     if is_google:
         gdrive.download(file_url, path + fileName, quiet=False)
+    elif session_response is not None:
+        with open(path + fileName, "wb") as output:
+            for chunk in session_response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+        session_response.close()
     else:
         download(file_url, path + fileName)
 
@@ -1851,12 +1892,131 @@ HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+class BrowserAuthRequired(RuntimeError):
+    pass
+
+
+def _is_erulabo_url(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return host == "erulabo.com" or host.endswith(".erulabo.com")
+    except Exception:
+        return False
+
+
+def _is_browser_challenge_response(response):
+    if response is None:
+        return True
+
+    if response.status_code in (403, 429, 503):
+        return True
+
+    try:
+        body = (response.text or "").lower()
+    except Exception:
+        body = ""
+
+    markers = (
+        "cf-turnstile",
+        "challenges.cloudflare.com",
+        "cf-chl-",
+        "just a moment",
+        "verify you are human",
+    )
+    return any(marker in body for marker in markers)
+
+
+def _session_from_browser_cookies(cookies):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    for cookie in cookies or []:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name:
+            continue
+
+        kwargs = {}
+        domain = cookie.get("domain")
+        path = cookie.get("path")
+        if domain:
+            kwargs["domain"] = domain
+        if path:
+            kwargs["path"] = path
+
+        session.cookies.set(name, value or "", **kwargs)
+
+    return session
+
+
+def _request_browser_authenticated_session(url):
+    if browser_auth_provider is None:
+        print_log("[-] 사용자 인증이 필요하지만 내장 브라우저를 사용할 수 없습니다.")
+        return None
+
+    print_log("[!] CAPTCHA / Cloudflare 사용자 인증이 필요합니다.")
+    cookies = browser_auth_provider(url)
+
+    if not cookies:
+        print_log("[=] 사용자 인증이 취소되었습니다.")
+        return None
+
+    print_log("[+] 브라우저 인증 정보를 가져왔습니다. 다운로드를 다시 시도합니다.")
+    return _session_from_browser_cookies(cookies)
+
+
+def _erulabo_page(session, url):
+    response = session.get(url, timeout=15)
+
+    if _is_browser_challenge_response(response):
+        raise BrowserAuthRequired("Erulabo browser verification required")
+
+    response.raise_for_status()
+    return response
+
+
+def _erulabo_download_url(session, page_url, file_url):
+    page_response = _erulabo_page(session, page_url)
+    csrf_token = extract_csrf_token(page_response.text)
+
+    if not csrf_token:
+        raise RuntimeError("Erulabo CSRF token not found")
+
+    token_response = session.post(
+        file_url + "/token",
+        json={},
+        headers={
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "X-CSRF-TOKEN": csrf_token,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": page_url,
+            "Origin": "https://erulabo.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        },
+        timeout=15,
+    )
+
+    if _is_browser_challenge_response(token_response):
+        raise BrowserAuthRequired("Erulabo token endpoint requires browser verification")
+
+    token_response.raise_for_status()
+    data = token_response.json()
+    return data.get("download_url", "")
+
+
 def extract_csrf_token(html, url_source=None):
     match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
     return match.group(1) if match else None
 
 def download_website(url,callback):
     global isDownloadError, download_progress_count, download_progress_length
+
+    if _is_erulabo_url(url):
+        download_erulabo(url, callback)
+        return
 
     url_source = get_url_source_website(url)
     if url_source is None:
@@ -1905,130 +2065,110 @@ def find_blog_standard(temps,callback):
     return 0
 
 
-# Cloudflare Turnstile 인증으로 Deprecated 
-def find_blog_1(temps,url,callback):
+def download_erulabo(url, callback):
+    global isDownloadError
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        try:
+            page_response = _erulabo_page(session, url)
+        except BrowserAuthRequired:
+            session = _request_browser_authenticated_session(url)
+            if session is None:
+                isDownloadError = 1
+                return
+            page_response = _erulabo_page(session, url)
+
+        soup = BeautifulSoup(page_response.text, "html.parser")
+        if find_blog_1(soup, url, callback, session=session) == 0:
+            isDownloadError = 1
+
+    except Exception as e:
+        print_log("[-] Erulabo 다운로드 실패 : %s" % e)
+        print_log(traceback.format_exc())
+        isDownloadError = 1
+
+
+def find_blog_1(temps, url, callback, session=None):
+    """Download Erulabo attachments, asking the GUI for human auth when needed."""
     global isDownloadError, download_progress_count, download_progress_length
 
-    blog_1_url = re.compile(r"(.*(https://erulabo.com/file).*)")
-    links = temps.find_all("button", attrs={"data-file-url": True})
+    if session is None:
+        session = requests.Session()
+        session.headers.update(HEADERS)
 
-    for a in links:
-        each_file = "https://erulabo.com" + a.attrs['data-file-url']
-        #print("data-file-url = "+each_file)
+    links = temps.find_all("button", attrs={"data-file-url": True})
+    if not links:
+        print_log("[-] Erulabo 첨부 파일을 찾지 못했습니다.")
+        return 0
+
+    for button in links:
+        each_file = urljoin("https://erulabo.com", button.attrs["data-file-url"])
+        each_file = each_file.replace("&amp;", "&")
 
         try:
-            each_file = each_file.replace('&amp;','&');
+            try:
+                download_url = _erulabo_download_url(session, url, each_file)
+            except BrowserAuthRequired:
+                session = _request_browser_authenticated_session(url)
+                if session is None:
+                    isDownloadError = 1
+                    return 0
+                download_url = _erulabo_download_url(session, url, each_file)
 
-            if bool(blog_1_url.match(each_file)):
+            if not download_url:
+                print_log("[-] Erulabo 다운로드 URL을 받지 못했습니다.")
+                continue
 
-                # Step 1: 게시글 접근 → 쿠키 + CSRF 토큰
-                session = requests.Session()
-                session.headers.update(HEADERS)
+            resolved_url = download_url
+            redirect_response = session.get(
+                download_url,
+                allow_redirects=False,
+                timeout=15,
+            )
 
-                resp = session.get(url, timeout=15)
-                resp.raise_for_status()
-                csrf_token = extract_csrf_token(resp.text)
+            if _is_browser_challenge_response(redirect_response):
+                raise BrowserAuthRequired("Erulabo download endpoint requires browser verification")
 
-                token_url = each_file + "/token";
-                token_resp = session.post(
-                    token_url,
-                    json={},  # Content-Length: 2 (빈 JSON body)
-                    headers={
-                        "Accept": "*/*",
-                        "Content-Type": "application/json",
-                        "X-CSRF-TOKEN": csrf_token,
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": url,
-                        "Origin": "https://erulabo.com",
-                        "Sec-Fetch-Dest": "empty",
-                        "Sec-Fetch-Mode": "cors",
-                        "Sec-Fetch-Site": "same-origin",
-                    },
-                    timeout=15,
-                );
+            if redirect_response.status_code in (301, 302, 303, 307, 308):
+                location = redirect_response.headers.get("Location", "")
+                if location:
+                    resolved_url = urljoin(download_url, location)
+                    print_log("  Redirect : " + resolved_url)
 
-                # Step 2: POST /file/{uuid}/token 으로 다운로드 URL 획득
-                data = token_resp.json();
-                download_url = data.get("download_url", ""); 
+            suggested_name = button.get("download") or button.get_text(strip=True)
+            if _download_detected_link(
+                resolved_url,
+                suggested_name,
+                callback,
+                session=session,
+            ):
+                return 1
 
-                if download_url:
-                    dl_resp = session.get(download_url, allow_redirects=False, timeout=15)
-
-                    if dl_resp.status_code in (301, 302, 303, 307, 308): # Google Drive URL
-                        each_file = dl_resp.headers.get("Location", "")
-                        print_log("Google Drive URL: " + each_file)
-                    else: # 리다이렉트 없음
-                        each_file = download_url
-
-            if bool(p_google_2_1.match(each_file)):
-                start_index = each_file.find("&id=") + 4;
-                end_index =  each_file.rfind("&confirm");
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            if bool(p_google_2_2.match(each_file)):
-                start_index = each_file.find("&id=") + 4;
-                end_index =  len(each_file);
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            if bool(p_google_3.match(each_file)):
-                start_index = each_file.find("?id=") + 4;
-                end_index =  each_file.rfind("&export");
-                each_file = "https://drive.google.com/file/d/" + each_file[start_index:end_index] + "/view"
-
-            # 구글 드라이브 주소가 검출되었을때
-            if bool(p_google.match(each_file)):
-
-                start_index = each_file.find("/d/") + 3;
-                end_index =  each_file.rfind("/view");
-
-                key = each_file[start_index:end_index]
-                each_file = "https://drive.google.com/uc?id="+key
-
-                remotefile = urlopen(each_file, timeout=REQUEST_TIMEOUT)
-                fileName = remotefile.headers.get_filename();
-
-                if fileName is not None:
-                    fileName = fileName.encode('ISO-8859-1').decode('UTF-8');
-                else:
-                    parsed_url = urlparse(each_file)
-                    fileName = os.path.basename(parsed_url.path)
-                    fileName = unquote(fileName)
-
-                path = outpath + smiDir
-
-                if fileName == "uc":
-                    fileName = gdrive.get_file_name(each_file)
-
-                #print_log(fileName);
-
-                if(not p_extension.match(fileName)):
-                    download_progress_count += 1
-                    callback(download_progress_count,download_progress_length)
-                    continue;
-
-                print_log("[=] 다운로드 시작 => "+ fileName)
-
-                if not os.path.exists(path):
-                    os.makedirs(path)
-
-                gdrive.download(each_file, path + fileName, quiet=False)
-                print_log("[+] 파일 다운로드가 완료 되었습니다. ")
-                    
-                download_progress_count += 1
-                callback(download_progress_count,download_progress_length)
-                return 1;
-    
+        except BrowserAuthRequired:
+            print_log("[-] 다운로드 단계에서 사용자 인증이 다시 필요합니다.")
+            isDownloadError = 1
+            return 0
         except urllib.error.HTTPError as e:
             print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
             download_progress_count += 1
-            return 0;
+            return 0
         except Exception as e:
             print_log("[-] Error : %s" % e)
             print_log(traceback.format_exc())
             download_progress_count += 1
-            return 0;
+            return 0
+
+    return 0
+
 
 def download_count_website(url):
+
+    # Erulabo는 사전 카운트 단계에서 CAPTCHA를 띄우지 않습니다.
+    if _is_erulabo_url(url):
+        return 1
 
     url_source = get_url_source_website(url)
 
