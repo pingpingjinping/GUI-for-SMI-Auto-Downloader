@@ -75,6 +75,7 @@ jobs:
             "Qt6Qml.dll",
             "Qt6QmlModels.dll",
             "Qt6Quick.dll",
+            "Qt6QuickWidgets.dll",
             "Qt6WebChannel.dll",
             "Qt6WebEngineCore.dll",
             "Qt6WebEngineQuick.dll",
@@ -135,6 +136,7 @@ jobs:
           $required = @(
             "QtPrintSupport.pyd",
             "Qt6PrintSupport.dll",
+            "Qt6QuickWidgets.dll",
             "QtWebEngineCore.pyd",
             "QtWebEngineWidgets.pyd",
             "QtWebChannel.pyd",
