@@ -70,6 +70,7 @@ quitSignal = False
 
 REQUEST_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 20
+BROWSER_AUTH_RETRY_LIMIT = 2
 
 # GUI가 제공하는 수동 CAPTCHA 인증 함수. CLI/비-GUI 환경에서는 None입니다.
 browser_auth_provider = None
@@ -245,25 +246,46 @@ def retry_all_pending_auth_items(callback):
     global AnimeName, AnimeNO, console_output
     global download_progress_count, download_progress_length
 
-    items = [
-        item for item in get_pending_auth_items()
-        if item.get("status") in ("pending", "queued")
-    ]
-    if not items:
-        return {"total": 0, "success": 0, "failed": 0, "cancelled": False}
+    if get_pending_auth_count() == 0:
+        return {
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "cancelled": False,
+            "remaining": 0,
+        }
 
-    # Any still-pending items are marked queued before we wait for the current
-    # full download to finish, so the UI clearly shows what will run next.
+    # Mark what exists now as queued for immediate UI feedback. More CAPTCHA
+    # items may still be discovered while the main full download is running.
     queue_all_pending_auth_retries()
 
     while not lock_Scheduler():
         time.sleep(0.5)
 
+    items = []
     success_count = 0
     failed_count = 0
     cancelled = False
 
     try:
+        # The full download has now released the scheduler lock. Include every
+        # CAPTCHA item that appeared while we were waiting, not only the items
+        # that existed when the user pressed "전체 처리 시작".
+        queue_all_pending_auth_retries()
+        items = [
+            item for item in get_pending_auth_items()
+            if item.get("status") in ("pending", "queued")
+        ]
+        if not items:
+            callback(0, 0, "처리할 보류 항목이 없습니다.", True)
+            return {
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": False,
+                "remaining": 0,
+            }
+
         browser_auth_interactive = True
         browser_auth_cancelled = False
         console_output = ""
@@ -386,7 +408,8 @@ def retry_all_pending_auth_items(callback):
         unlock_Scheduler()
 
 def retry_pending_auth_item(item_id, callback):
-    global browser_auth_interactive, AnimeName, AnimeNO, console_output
+    global browser_auth_interactive, browser_auth_cancelled
+    global AnimeName, AnimeNO, console_output
 
     item = next((x for x in get_pending_auth_items() if x.get("id") == item_id), None)
     if item is None:
@@ -400,6 +423,7 @@ def retry_pending_auth_item(item_id, callback):
     try:
         _update_pending_auth_status(item_id, "authenticating")
         browser_auth_interactive = True
+        browser_auth_cancelled = False
         AnimeName = item.get("animeName") or "None"
         AnimeNO = item.get("animeNo", -1)
         caption = dict(item.get("caption") or {})
@@ -434,6 +458,7 @@ def retry_pending_auth_item(item_id, callback):
         return False
     finally:
         browser_auth_interactive = False
+        browser_auth_cancelled = False
         unlock_Scheduler()
 
 def init_paths(autoPath):
@@ -2532,32 +2557,46 @@ def download_erulabo(url, callback):
         session = requests.Session()
         session.headers.update(HEADERS)
 
+    auth_refreshes = 0
+
     try:
-        try:
-            page_response = _erulabo_page(session, url)
-        except BrowserAuthRequired as e:
-            session = _request_browser_authenticated_session(
-                url,
-                reason=str(e),
-                force_refresh=used_cached_auth,
-            )
-            if session is None:
-                isDownloadError = 1
-                return
-            page_response = _erulabo_page(session, url)
+        while True:
+            try:
+                page_response = _erulabo_page(session, url)
+                break
+            except BrowserAuthRequired as e:
+                if auth_refreshes >= BROWSER_AUTH_RETRY_LIMIT:
+                    raise
+
+                session = _request_browser_authenticated_session(
+                    url,
+                    reason=str(e),
+                    force_refresh=(used_cached_auth or auth_refreshes > 0),
+                )
+                if session is None:
+                    isDownloadError = 1
+                    return
+
+                used_cached_auth = True
+                auth_refreshes += 1
 
         soup = BeautifulSoup(page_response.text, "html.parser")
         if find_blog_1(soup, url, callback, session=session) == 0:
             isDownloadError = 1
 
+    except BrowserAuthRequired as e:
+        print_log(
+            "[-] 사용자 인증을 반복해도 Erulabo 페이지 인증이 유지되지 않습니다. : %s"
+            % e
+        )
+        isDownloadError = 1
     except Exception as e:
         print_log("[-] Erulabo 다운로드 실패 : %s" % e)
         print_log(traceback.format_exc())
         isDownloadError = 1
 
-
 def find_blog_1(temps, url, callback, session=None):
-    """Download Erulabo attachments, asking the GUI for human auth when needed."""
+    """Download Erulabo attachments with bounded browser-auth refreshes."""
     global isDownloadError, download_progress_count, download_progress_length
 
     if session is None:
@@ -2572,11 +2611,63 @@ def find_blog_1(temps, url, callback, session=None):
     for button in links:
         each_file = urljoin("https://erulabo.com", button.attrs["data-file-url"])
         each_file = each_file.replace("&amp;", "&")
+        auth_refreshes = 0
 
-        try:
+        while True:
             try:
                 download_url = _erulabo_download_url(session, url, each_file)
+
+                if not download_url:
+                    print_log("[-] Erulabo 다운로드 URL을 받지 못했습니다.")
+                    break
+
+                resolved_url = download_url
+                redirect_response = session.get(
+                    download_url,
+                    allow_redirects=False,
+                    timeout=15,
+                )
+
+                if _is_browser_challenge_response(redirect_response):
+                    raise BrowserAuthRequired(
+                        "Erulabo download endpoint requires browser verification"
+                    )
+
+                if redirect_response.status_code in (301, 302, 303, 307, 308):
+                    location = redirect_response.headers.get("Location", "")
+                    if location:
+                        resolved_url = urljoin(download_url, location)
+                        print_log("  Redirect : " + resolved_url)
+
+                suggested_name = button.get("download") or button.get_text(strip=True)
+                if _download_detected_link(
+                    resolved_url,
+                    suggested_name,
+                    callback,
+                    session=session,
+                ):
+                    return 1
+
+                break
+
             except BrowserAuthRequired as e:
+                if not browser_auth_interactive:
+                    _enqueue_current_pending_auth(url, str(e))
+                    print_log("[!] 다운로드 단계의 인증 항목을 보류목록에 추가했습니다.")
+                    print_log("[=] 다음 다운로드로 계속 진행합니다.")
+                    isDownloadError = 1
+                    return 0
+
+                if auth_refreshes >= BROWSER_AUTH_RETRY_LIMIT:
+                    print_log(
+                        "[-] 사용자 인증을 반복해도 다운로드 인증이 유지되지 않습니다."
+                    )
+                    isDownloadError = 1
+                    return 0
+
+                print_log(
+                    "[!] 다운로드 중 인증이 만료되어 인증창을 다시 엽니다."
+                )
                 session = _request_browser_authenticated_session(
                     url,
                     reason=str(e),
@@ -2585,58 +2676,21 @@ def find_blog_1(temps, url, callback, session=None):
                 if session is None:
                     isDownloadError = 1
                     return 0
-                download_url = _erulabo_download_url(session, url, each_file)
 
-            if not download_url:
-                print_log("[-] Erulabo 다운로드 URL을 받지 못했습니다.")
+                auth_refreshes += 1
                 continue
 
-            resolved_url = download_url
-            redirect_response = session.get(
-                download_url,
-                allow_redirects=False,
-                timeout=15,
-            )
-
-            if _is_browser_challenge_response(redirect_response):
-                raise BrowserAuthRequired("Erulabo download endpoint requires browser verification")
-
-            if redirect_response.status_code in (301, 302, 303, 307, 308):
-                location = redirect_response.headers.get("Location", "")
-                if location:
-                    resolved_url = urljoin(download_url, location)
-                    print_log("  Redirect : " + resolved_url)
-
-            suggested_name = button.get("download") or button.get_text(strip=True)
-            if _download_detected_link(
-                resolved_url,
-                suggested_name,
-                callback,
-                session=session,
-            ):
-                return 1
-
-        except BrowserAuthRequired as e:
-            if not browser_auth_interactive:
-                _enqueue_current_pending_auth(url, str(e))
-                print_log("[!] 다운로드 단계의 인증 항목을 보류목록에 추가했습니다.")
-                print_log("[=] 다음 다운로드로 계속 진행합니다.")
-            else:
-                print_log("[-] 인증 후에도 다운로드 단계에서 사용자 인증이 다시 필요합니다.")
-            isDownloadError = 1
-            return 0
-        except urllib.error.HTTPError as e:
-            print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
-            download_progress_count += 1
-            return 0
-        except Exception as e:
-            print_log("[-] Error : %s" % e)
-            print_log(traceback.format_exc())
-            download_progress_count += 1
-            return 0
+            except urllib.error.HTTPError as e:
+                print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
+                download_progress_count += 1
+                return 0
+            except Exception as e:
+                print_log("[-] Error : %s" % e)
+                print_log(traceback.format_exc())
+                download_progress_count += 1
+                return 0
 
     return 0
-
 
 def download_count_website(url):
 
