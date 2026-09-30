@@ -193,8 +193,16 @@ class PendingAuthPage(QObject):
     def open_page(self):
         self.refresh()
         self.widgets.stackedWidget.setCurrentWidget(self.page)
-        # 기존 프로젝트는 modules <-> main 순환 참조가 있어 이 동적
-        # 페이지에서는 UIFunctions를 직접 import하지 않습니다.
+
+        # Import lazily here. A module-level UIFunctions import creates a
+        # gui <-> modules startup cycle, but at click time initialization is
+        # already complete and the normal menu selection styling is safe.
+        from modules.ui_functions import UIFunctions
+
+        UIFunctions.resetStyle(self.MainWindow, "btn_pending")
+        self.menu_button.setStyleSheet(
+            UIFunctions.selectMenu(self.menu_button.styleSheet())
+        )
 
     def _status_text(self, value):
         return {
