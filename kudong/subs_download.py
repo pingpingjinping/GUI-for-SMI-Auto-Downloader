@@ -70,13 +70,17 @@ quitSignal = False
 
 REQUEST_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 20
+BROWSER_AUTH_RETRY_LIMIT = 2
 
 # GUI가 제공하는 수동 CAPTCHA 인증 함수. CLI/비-GUI 환경에서는 None입니다.
 browser_auth_provider = None
 pending_auth_changed_provider = None
 browser_auth_interactive = False
+browser_auth_cancelled = False
 current_caption_context = None
 pending_auth_lock = threading.Lock()
+browser_auth_cache_lock = threading.Lock()
+browser_auth_cookie_cache = {}
 
 def set_browser_auth_provider(provider):
     global browser_auth_provider
@@ -221,8 +225,191 @@ def _enqueue_current_pending_auth(url, reason):
         _notify_pending_auth_changed()
     return changed
 
+def queue_all_pending_auth_retries():
+    changed = False
+    count = 0
+    with pending_auth_lock:
+        items = _load_pending_auth_unlocked()
+        for item in items:
+            if item.get("status") == "pending":
+                item["status"] = "queued"
+                changed = True
+                count += 1
+        if changed:
+            _save_pending_auth_unlocked(items)
+    if changed:
+        _notify_pending_auth_changed()
+    return count
+
+def retry_all_pending_auth_items(callback):
+    global browser_auth_interactive, browser_auth_cancelled
+    global AnimeName, AnimeNO, console_output
+    global download_progress_count, download_progress_length
+
+    if get_pending_auth_count() == 0:
+        return {
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "cancelled": False,
+            "remaining": 0,
+        }
+
+    # Mark what exists now as queued for immediate UI feedback. More CAPTCHA
+    # items may still be discovered while the main full download is running.
+    queue_all_pending_auth_retries()
+
+    while not lock_Scheduler():
+        time.sleep(0.5)
+
+    items = []
+    success_count = 0
+    failed_count = 0
+    cancelled = False
+
+    try:
+        # The full download has now released the scheduler lock. Include every
+        # CAPTCHA item that appeared while we were waiting, not only the items
+        # that existed when the user pressed "전체 처리 시작".
+        queue_all_pending_auth_retries()
+        items = [
+            item for item in get_pending_auth_items()
+            if item.get("status") in ("pending", "queued")
+        ]
+        if not items:
+            callback(0, 0, "처리할 보류 항목이 없습니다.", True)
+            return {
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "cancelled": False,
+                "remaining": 0,
+            }
+
+        browser_auth_interactive = True
+        browser_auth_cancelled = False
+        console_output = ""
+
+        if not os.path.exists(log_path):
+            os.makedirs(log_path)
+        new_filename = get_new_log_file()
+
+        total = len(items)
+        callback(0, total, f"보류 항목 0/{total} - 전체 처리 시작...")
+
+        for index, original_item in enumerate(items, start=1):
+            if browser_auth_cancelled:
+                cancelled = True
+                break
+
+            current = next(
+                (
+                    x for x in get_pending_auth_items()
+                    if x.get("id") == original_item.get("id")
+                ),
+                None,
+            )
+            if current is None:
+                continue
+
+            item_id = current.get("id")
+            _update_pending_auth_status(item_id, "authenticating")
+
+            AnimeName = current.get("animeName") or "None"
+            AnimeNO = current.get("animeNo", -1)
+            caption = dict(current.get("caption") or {})
+            if not caption:
+                failed_count += 1
+                _update_pending_auth_status(item_id, "pending")
+                continue
+
+            download_progress_count = 0
+            download_progress_length = 1
+
+            def batch_callback(_progress, _count, output="None", isFinished=False):
+                if output == "None":
+                    status = "다운로드 중..."
+                else:
+                    status = output
+                    prefix = "<" + AnimeName + "> "
+                    if status.startswith(prefix):
+                        status = status[len(prefix):]
+                callback(
+                    index - 1,
+                    total,
+                    f"보류 항목 {index}/{total} - {AnimeName} - {status}",
+                )
+
+            _requestAnimeSMI(AnimeNO, batch_callback, new_filename, [caption])
+
+            if isDownloadError == 0:
+                remove_pending_auth_item(item_id)
+                success_count += 1
+            else:
+                _update_pending_auth_status(item_id, "pending")
+                failed_count += 1
+
+            callback(
+                index,
+                total,
+                f"보류 항목 {index}/{total} 처리 완료 "
+                f"(성공 {success_count}, 실패 {failed_count})",
+            )
+
+        if browser_auth_cancelled:
+            cancelled = True
+            # Do not leave untouched items looking queued after the user
+            # cancelled the single authentication window.
+            with pending_auth_lock:
+                pending_items = _load_pending_auth_unlocked()
+                changed = False
+                for item in pending_items:
+                    if item.get("status") == "queued":
+                        item["status"] = "pending"
+                        changed = True
+                if changed:
+                    _save_pending_auth_unlocked(pending_items)
+            _notify_pending_auth_changed()
+
+        remaining = get_pending_auth_count()
+        message = (
+            f"보류 전체 처리 종료 - 성공 {success_count}, 실패 {failed_count}, "
+            f"남음 {remaining}"
+        )
+        if cancelled:
+            message += " (사용자 인증 취소)"
+
+        callback(len(items), len(items), message, True)
+        return {
+            "total": len(items),
+            "success": success_count,
+            "failed": failed_count,
+            "cancelled": cancelled,
+            "remaining": remaining,
+        }
+    except Exception as e:
+        print_log("[-] 보류 전체 처리 오류 : %s" % e)
+        print_log(traceback.format_exc())
+        reset_pending_auth_runtime_statuses()
+        try:
+            callback(0, 0, "보류 전체 처리 중 오류가 발생했습니다.", True)
+        except Exception:
+            pass
+        return {
+            "total": len(items),
+            "success": success_count,
+            "failed": failed_count + 1,
+            "cancelled": cancelled,
+            "remaining": get_pending_auth_count(),
+        }
+    finally:
+        browser_auth_interactive = False
+        browser_auth_cancelled = False
+        unlock_Scheduler()
+
 def retry_pending_auth_item(item_id, callback):
-    global browser_auth_interactive, AnimeName, AnimeNO, console_output
+    global browser_auth_interactive, browser_auth_cancelled
+    global AnimeName, AnimeNO, console_output
 
     item = next((x for x in get_pending_auth_items() if x.get("id") == item_id), None)
     if item is None:
@@ -236,6 +423,7 @@ def retry_pending_auth_item(item_id, callback):
     try:
         _update_pending_auth_status(item_id, "authenticating")
         browser_auth_interactive = True
+        browser_auth_cancelled = False
         AnimeName = item.get("animeName") or "None"
         AnimeNO = item.get("animeNo", -1)
         caption = dict(item.get("caption") or {})
@@ -270,6 +458,7 @@ def retry_pending_auth_item(item_id, callback):
         return False
     finally:
         browser_auth_interactive = False
+        browser_auth_cancelled = False
         unlock_Scheduler()
 
 def init_paths(autoPath):
@@ -2169,7 +2358,51 @@ def _session_from_browser_cookies(cookies, user_agent=None):
     return session
 
 
-def _request_browser_authenticated_session(url, reason=None):
+def _browser_auth_cache_key(url):
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+def _cache_browser_auth_result(url, cookies, user_agent=None):
+    key = _browser_auth_cache_key(url)
+    if not key:
+        return
+    with browser_auth_cache_lock:
+        browser_auth_cookie_cache[key] = {
+            "cookies": [dict(cookie) for cookie in (cookies or [])],
+            "user_agent": user_agent,
+        }
+
+def _clear_browser_auth_cache(url):
+    key = _browser_auth_cache_key(url)
+    if not key:
+        return
+    with browser_auth_cache_lock:
+        browser_auth_cookie_cache.pop(key, None)
+
+def _cached_browser_authenticated_session(url):
+    key = _browser_auth_cache_key(url)
+    if not key:
+        return None
+    with browser_auth_cache_lock:
+        cached = browser_auth_cookie_cache.get(key)
+        if cached is None:
+            return None
+        cached = {
+            "cookies": [dict(cookie) for cookie in cached.get("cookies", [])],
+            "user_agent": cached.get("user_agent"),
+        }
+    if not cached["cookies"]:
+        return None
+    return _session_from_browser_cookies(
+        cached["cookies"],
+        user_agent=cached.get("user_agent"),
+    )
+
+def _request_browser_authenticated_session(url, reason=None, force_refresh=False):
+    global browser_auth_cancelled
+
     if not browser_auth_interactive:
         _enqueue_current_pending_auth(
             url,
@@ -2179,6 +2412,14 @@ def _request_browser_authenticated_session(url, reason=None):
         print_log("[=] 인증창은 열지 않고 다음 다운로드로 계속 진행합니다.")
         return None
 
+    if not force_refresh:
+        cached_session = _cached_browser_authenticated_session(url)
+        if cached_session is not None:
+            print_log("[+] 이전 인증 쿠키를 재사용합니다.")
+            return cached_session
+    else:
+        _clear_browser_auth_cache(url)
+
     if browser_auth_provider is None:
         print_log("[-] 사용자 인증이 필요하지만 내장 브라우저를 사용할 수 없습니다.")
         return None
@@ -2187,6 +2428,7 @@ def _request_browser_authenticated_session(url, reason=None):
     auth_result = browser_auth_provider(url)
 
     if not auth_result:
+        browser_auth_cancelled = True
         print_log("[=] 사용자 인증이 취소되었습니다.")
         return None
 
@@ -2201,6 +2443,7 @@ def _request_browser_authenticated_session(url, reason=None):
         print_log("[=] 브라우저 인증 쿠키를 확인하지 못했습니다.")
         return None
 
+    _cache_browser_auth_result(url, cookies, user_agent=user_agent)
     print_log("[+] 브라우저 인증 정보를 가져왔습니다. 다운로드를 다시 시도합니다.")
     return _session_from_browser_cookies(cookies, user_agent=user_agent)
 
@@ -2308,31 +2551,52 @@ def find_blog_standard(temps,callback):
 def download_erulabo(url, callback):
     global isDownloadError
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = _cached_browser_authenticated_session(url)
+    used_cached_auth = session is not None
+    if session is None:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+    auth_refreshes = 0
 
     try:
-        try:
-            page_response = _erulabo_page(session, url)
-        except BrowserAuthRequired as e:
-            session = _request_browser_authenticated_session(url, reason=str(e))
-            if session is None:
-                isDownloadError = 1
-                return
-            page_response = _erulabo_page(session, url)
+        while True:
+            try:
+                page_response = _erulabo_page(session, url)
+                break
+            except BrowserAuthRequired as e:
+                if auth_refreshes >= BROWSER_AUTH_RETRY_LIMIT:
+                    raise
+
+                session = _request_browser_authenticated_session(
+                    url,
+                    reason=str(e),
+                    force_refresh=(used_cached_auth or auth_refreshes > 0),
+                )
+                if session is None:
+                    isDownloadError = 1
+                    return
+
+                used_cached_auth = True
+                auth_refreshes += 1
 
         soup = BeautifulSoup(page_response.text, "html.parser")
         if find_blog_1(soup, url, callback, session=session) == 0:
             isDownloadError = 1
 
+    except BrowserAuthRequired as e:
+        print_log(
+            "[-] 사용자 인증을 반복해도 Erulabo 페이지 인증이 유지되지 않습니다. : %s"
+            % e
+        )
+        isDownloadError = 1
     except Exception as e:
         print_log("[-] Erulabo 다운로드 실패 : %s" % e)
         print_log(traceback.format_exc())
         isDownloadError = 1
 
-
 def find_blog_1(temps, url, callback, session=None):
-    """Download Erulabo attachments, asking the GUI for human auth when needed."""
+    """Download Erulabo attachments with bounded browser-auth refreshes."""
     global isDownloadError, download_progress_count, download_progress_length
 
     if session is None:
@@ -2347,67 +2611,86 @@ def find_blog_1(temps, url, callback, session=None):
     for button in links:
         each_file = urljoin("https://erulabo.com", button.attrs["data-file-url"])
         each_file = each_file.replace("&amp;", "&")
+        auth_refreshes = 0
 
-        try:
+        while True:
             try:
                 download_url = _erulabo_download_url(session, url, each_file)
+
+                if not download_url:
+                    print_log("[-] Erulabo 다운로드 URL을 받지 못했습니다.")
+                    break
+
+                resolved_url = download_url
+                redirect_response = session.get(
+                    download_url,
+                    allow_redirects=False,
+                    timeout=15,
+                )
+
+                if _is_browser_challenge_response(redirect_response):
+                    raise BrowserAuthRequired(
+                        "Erulabo download endpoint requires browser verification"
+                    )
+
+                if redirect_response.status_code in (301, 302, 303, 307, 308):
+                    location = redirect_response.headers.get("Location", "")
+                    if location:
+                        resolved_url = urljoin(download_url, location)
+                        print_log("  Redirect : " + resolved_url)
+
+                suggested_name = button.get("download") or button.get_text(strip=True)
+                if _download_detected_link(
+                    resolved_url,
+                    suggested_name,
+                    callback,
+                    session=session,
+                ):
+                    return 1
+
+                break
+
             except BrowserAuthRequired as e:
-                session = _request_browser_authenticated_session(url, reason=str(e))
+                if not browser_auth_interactive:
+                    _enqueue_current_pending_auth(url, str(e))
+                    print_log("[!] 다운로드 단계의 인증 항목을 보류목록에 추가했습니다.")
+                    print_log("[=] 다음 다운로드로 계속 진행합니다.")
+                    isDownloadError = 1
+                    return 0
+
+                if auth_refreshes >= BROWSER_AUTH_RETRY_LIMIT:
+                    print_log(
+                        "[-] 사용자 인증을 반복해도 다운로드 인증이 유지되지 않습니다."
+                    )
+                    isDownloadError = 1
+                    return 0
+
+                print_log(
+                    "[!] 다운로드 중 인증이 만료되어 인증창을 다시 엽니다."
+                )
+                session = _request_browser_authenticated_session(
+                    url,
+                    reason=str(e),
+                    force_refresh=True,
+                )
                 if session is None:
                     isDownloadError = 1
                     return 0
-                download_url = _erulabo_download_url(session, url, each_file)
 
-            if not download_url:
-                print_log("[-] Erulabo 다운로드 URL을 받지 못했습니다.")
+                auth_refreshes += 1
                 continue
 
-            resolved_url = download_url
-            redirect_response = session.get(
-                download_url,
-                allow_redirects=False,
-                timeout=15,
-            )
-
-            if _is_browser_challenge_response(redirect_response):
-                raise BrowserAuthRequired("Erulabo download endpoint requires browser verification")
-
-            if redirect_response.status_code in (301, 302, 303, 307, 308):
-                location = redirect_response.headers.get("Location", "")
-                if location:
-                    resolved_url = urljoin(download_url, location)
-                    print_log("  Redirect : " + resolved_url)
-
-            suggested_name = button.get("download") or button.get_text(strip=True)
-            if _download_detected_link(
-                resolved_url,
-                suggested_name,
-                callback,
-                session=session,
-            ):
-                return 1
-
-        except BrowserAuthRequired as e:
-            if not browser_auth_interactive:
-                _enqueue_current_pending_auth(url, str(e))
-                print_log("[!] 다운로드 단계의 인증 항목을 보류목록에 추가했습니다.")
-                print_log("[=] 다음 다운로드로 계속 진행합니다.")
-            else:
-                print_log("[-] 인증 후에도 다운로드 단계에서 사용자 인증이 다시 필요합니다.")
-            isDownloadError = 1
-            return 0
-        except urllib.error.HTTPError as e:
-            print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
-            download_progress_count += 1
-            return 0
-        except Exception as e:
-            print_log("[-] Error : %s" % e)
-            print_log(traceback.format_exc())
-            download_progress_count += 1
-            return 0
+            except urllib.error.HTTPError as e:
+                print_log("[=] 해당 URL은 스킵되었습니다. : %s" % e)
+                download_progress_count += 1
+                return 0
+            except Exception as e:
+                print_log("[-] Error : %s" % e)
+                print_log(traceback.format_exc())
+                download_progress_count += 1
+                return 0
 
     return 0
-
 
 def download_count_website(url):
 

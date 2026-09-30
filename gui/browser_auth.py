@@ -31,7 +31,8 @@ class CaptchaAuthDialog(QDialog):
 
         info = QLabel(
             "이 사이트가 CAPTCHA / Cloudflare 인증을 요구합니다.\n"
-            "아래 브라우저에서 직접 인증한 뒤 ‘인증 완료’를 눌러주세요."
+            "아래 브라우저에서는 인증만 진행해주세요. 파일 다운로드는 차단됩니다.\n"
+            "원래 사이트가 정상 표시되면 ‘인증 완료’를 눌러주세요."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -146,7 +147,19 @@ class BrowserAuthBridge(QObject):
         # This avoids reusing a cached Turnstile error page after an app update.
         self.profile.clearHttpCache()
 
+        # 인증창은 쿠키를 얻는 용도만 사용합니다. 사이트가 CAPTCHA 통과
+        # 직후 자동 다운로드를 시도해도 브라우저가 파일을 저장하지 않도록
+        # 모든 WebEngine 다운로드 요청을 취소합니다.
+        self.profile.downloadRequested.connect(self._cancel_download)
+
         self.authRequested.connect(self._open_auth_dialog)
+
+    @Slot(object)
+    def _cancel_download(self, download):
+        try:
+            download.cancel()
+        except Exception:
+            pass
 
     def request_auth(self, url):
         # Normal downloads run in a Python worker thread. If this is ever
